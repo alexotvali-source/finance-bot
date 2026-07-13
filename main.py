@@ -1,19 +1,23 @@
 """
-Telegram-бот для финансового учёта управляющего.
+Telegram-бот — голосовой ассистент для дневных заметок.
 
-Что делает:
-  - принимает текстовые (и по желанию голосовые) сообщения,
-  - разбирает их через Claude на операции: приход / расход / выдача /
-    возврат / приём в управление / выплата из управления,
-  - отправляет операции в Google-таблицу (через Apps Script),
-  - в ответ пишет подтверждение и актуальные балансы.
+Как работает:
+  1. Надиктовываешь голосовое (или пишешь текст).
+  2. Whisper (OpenAI) расшифровывает аудио в текст.
+  3. Claude приводит расшифровку в порядок: чистит ошибки распознавания,
+     структурирует по пунктам, выделяет цифры/суммы и даёт короткую выжимку.
+  4. Заметка сохраняется в файл текущего дня.
+  5. Команда /day собирает сводную выжимку за весь день — её кладёшь в Cowork
+     «daily dollar balance».
 
-Все ключи и адреса задаются через переменные окружения (см. README и .env.example).
+Позже функционал легко расширить (категории, экспорт, автосводка вечером).
+Все ключи — через переменные окружения (см. .env.example и README).
 """
 
 import os
 import json
 import logging
+from datetime import datetime, timezone
 
 import requests
 from anthropic import Anthropic
@@ -29,88 +33,52 @@ from telegram.ext import (
 # ---------- Настройки из переменных окружения ----------
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-SHEET_WEBHOOK_URL = os.environ["SHEET_WEBHOOK_URL"]      # URL веб-приложения Apps Script
-SHEET_SECRET = os.environ["SHEET_SECRET"]               # тот же секрет, что в скрипте
-ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID", "") # твой Telegram user id (защита)
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")   # опционально, для голосовых
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]           # для расшифровки голосовых (Whisper)
+MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
+NOTES_DIR = os.environ.get("NOTES_DIR", "notes")
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("finance-bot")
-anthropic = Anthropic(api_key=ANTHROPIC_API_KEY)
-
-# ---------- Промпт для разбора сообщений ----------
-SYSTEM_PROMPT = """Ты — парсер финансовых операций управляющего. На вход приходит
-свободный текст на русском о движении денег. Верни СТРОГО JSON без пояснений.
-
-Формат:
-{
-  "operations": [
-    {
-      "type": "приход|расход|выдача|возврат|приём_в_управление|выплата_управления",
-      "currency": "USD|RUB",
-      "amount": <число, всегда положительное>,
-      "counterparty": "<имя человека или источник, если есть; иначе пусто>",
-      "comment": "<краткое назначение>"
-    }
-  ],
-  "note": "<короткий комментарий пользователю на русском>"
+# Доступ: список разрешённых Telegram user id (через запятую). Пусто => не пускаем никого.
+ALLOWED_USER_IDS = {
+    uid.strip()
+    for uid in os.environ.get("ALLOWED_USER_ID", "").replace(";", ",").split(",")
+    if uid.strip()
 }
 
-Правила определения типа:
-- "приход": деньги пришли ко мне (доход, поступление, занёс, прислали).
-- "расход": я потратил (купил, оплатил, потратил).
-- "выдача": я выдал кому-то деньги, и он теперь мне должен (выдал, дал в долг).
-- "возврат": мне вернули ранее выданное (вернул долг, отдал).
-- "приём_в_управление": инвестор/человек дал мне деньги в управление.
-- "выплата_управления": я вернул инвестору его деньги из управления.
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("voice-notes-bot")
+anthropic = Anthropic(api_key=ANTHROPIC_API_KEY)
 
-Валюта: "доллары/баксы/usd/$" -> USD; "рубли/руб/₽/р" -> RUB.
-Если валюта не указана явно, но сумма в рублях по контексту — RUB; иначе спрашивать не нужно,
-ставь наиболее вероятную и упомяни это в note.
-В одном сообщении может быть несколько операций — верни их все.
-Если это не операция (вопрос, приветствие), верни "operations": [] и заполни note.
-"""
+# ---------- Промпты ----------
+STRUCTURE_PROMPT = """Ты приводишь в порядок надиктованную голосовую заметку.
+На вход — сырая расшифровка речи на русском (возможны ошибки распознавания).
 
+Сделай:
+1. Аккуратно исправь очевидные ошибки распознавания и пунктуацию, НЕ выдумывая
+   фактов, которых не было. Числа, суммы, имена сохраняй точно.
+2. Структурируй содержание по пунктам (маркированный список), сгруппировав по смыслу.
+3. Отдельно выдели все цифры/суммы/деньги, если они есть.
 
-def parse_message(text: str) -> dict:
-    """Разбирает текст в операции через Claude."""
-    resp = anthropic.messages.create(
-        model=MODEL,
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": text}],
-    )
-    raw = resp.content[0].text.strip()
-    # На случай, если модель обернёт в ```json
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        raw = raw[raw.find("{"):]
-    data = json.loads(raw)
-    for op in data.get("operations", []):
-        op["raw"] = text
-    return data
+Верни ответ в таком виде (без лишних пояснений):
+
+📝 <краткая выжимка одной-двумя строками>
+
+• <пункт>
+• <пункт>
+..."""
+
+DIGEST_PROMPT = """Тебе дают несколько структурированных заметок за один день.
+Собери из них ОДНУ сводную выжимку дня — так, чтобы её можно было целиком
+вставить в рабочий документ.
+
+Требования:
+- Объедини повторяющееся, убери воду, сохрани все конкретные цифры, суммы и имена.
+- Сгруппируй по темам, используй маркированные пункты.
+- В самом верху — 2-3 строки итога дня.
+- Пиши по-русски, деловым и компактным стилем."""
 
 
-def send_to_sheet(operations: list) -> dict:
-    """Отправляет операции в Google-таблицу, возвращает балансы."""
-    r = requests.post(
-        SHEET_WEBHOOK_URL,
-        json={"secret": SHEET_SECRET, "operations": operations},
-        timeout=30,
-    )
-    return r.json()
-
-
-def get_balances() -> dict:
-    r = requests.get(SHEET_WEBHOOK_URL, params={"secret": SHEET_SECRET}, timeout=30)
-    return r.json()
-
-
+# ---------- Транскрипция ----------
 def transcribe_voice(file_path: str) -> str:
-    """Опционально: расшифровка голосового через OpenAI Whisper (нужен OPENAI_API_KEY)."""
-    if not OPENAI_API_KEY:
-        return ""
     with open(file_path, "rb") as f:
         r = requests.post(
             "https://api.openai.com/v1/audio/transcriptions",
@@ -119,134 +87,173 @@ def transcribe_voice(file_path: str) -> str:
             data={"model": "whisper-1", "language": "ru"},
             timeout=120,
         )
-    return r.json().get("text", "")
+    r.raise_for_status()
+    return r.json().get("text", "").strip()
 
 
-def format_balances(balances: dict) -> str:
-    """Красиво форматирует балансы для ответа."""
-    if not balances:
-        return ""
-    lines = ["\n📊 <b>Текущие балансы</b>"]
-    cash = balances.get("cash", {})
-    lines.append(f"Касса: {fmt(cash.get('USD', 0))} $ | {fmt(cash.get('RUB', 0))} ₽")
-
-    mgmt = [m for m in balances.get("mgmt", []) if m.get("usd") or m.get("rub")]
-    if mgmt:
-        lines.append("\n💼 <b>В управлении</b>")
-        for m in mgmt:
-            lines.append(f"• {m['name']}: {fmt(m['usd'])} $ | {fmt(m['rub'])} ₽")
-
-    debt = [d for d in balances.get("debt", []) if d.get("usd") or d.get("rub")]
-    if debt:
-        lines.append("\n🤝 <b>Долги (+ мне должны / − я должен)</b>")
-        for d in debt:
-            lines.append(f"• {d['name']}: {fmt(d['usd'])} $ | {fmt(d['rub'])} ₽")
-    return "\n".join(lines)
+# ---------- Модель ----------
+def _claude(system: str, user: str, max_tokens: int = 2048) -> str:
+    resp = anthropic.messages.create(
+        model=MODEL,
+        max_tokens=max_tokens,
+        system=system,
+        messages=[{"role": "user", "content": user}],
+    )
+    return "".join(b.text for b in resp.content if b.type == "text").strip()
 
 
-def fmt(x) -> str:
-    try:
-        n = float(x)
-    except (TypeError, ValueError):
-        return str(x)
-    return f"{n:,.0f}".replace(",", " ")
+def structure_note(text: str) -> str:
+    return _claude(STRUCTURE_PROMPT, text)
 
 
+def make_digest(notes: list) -> str:
+    joined = "\n\n---\n\n".join(
+        f"[{n['ts']}]\n{n['structured']}" for n in notes
+    )
+    return _claude(DIGEST_PROMPT, joined, max_tokens=3000)
+
+
+# ---------- Хранение заметок по дням ----------
+def _today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _day_path(user_id: str, day: str) -> str:
+    d = os.path.join(NOTES_DIR, str(user_id))
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f"{day}.json")
+
+
+def load_day(user_id: str, day: str) -> list:
+    path = _day_path(user_id, day)
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def append_note(user_id: str, transcript: str, structured: str) -> None:
+    day = _today()
+    notes = load_day(user_id, day)
+    notes.append(
+        {
+            "ts": datetime.now(timezone.utc).strftime("%H:%M"),
+            "transcript": transcript,
+            "structured": structured,
+        }
+    )
+    with open(_day_path(user_id, day), "w", encoding="utf-8") as f:
+        json.dump(notes, f, ensure_ascii=False, indent=2)
+
+
+# ---------- Доступ ----------
 def allowed(update: Update) -> bool:
-    if not ALLOWED_USER_ID:
-        return True
-    return str(update.effective_user.id) == str(ALLOWED_USER_ID)
+    # Fail-closed: если список пуст — не пускаем НИКОГО.
+    if not ALLOWED_USER_IDS:
+        return False
+    user = update.effective_user
+    return bool(user) and str(user.id) in ALLOWED_USER_IDS
 
 
 # ---------- Хендлеры ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Я веду твой финансовый учёт.\n\n"
-        "Просто пиши операции обычным текстом, например:\n"
-        "• «приход 5000 долларов от Игоря»\n"
-        "• «потратил 3000 рублей на рекламу»\n"
-        "• «выдал Диме 500 баксов на закуп»\n"
-        "• «Саша занёс 10000 долларов в управление»\n\n"
-        "Команда /balance — показать текущие балансы.\n"
-        f"Твой user id: {update.effective_user.id}"
+        "Привет! Надиктовывай голосовые — я расшифрую, структурирую и дам выжимку.\n\n"
+        "• голосовое или текст — заметка на сегодня\n"
+        "• /day — сводная выжимка за день (её кладёшь в Cowork)\n"
+        "• /clear — очистить заметки за сегодня\n\n"
+        f"Твой Telegram user id: <code>{update.effective_user.id}</code>",
+        parse_mode="HTML",
     )
 
 
-async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        return
-    res = get_balances()
-    if res.get("ok"):
-        await update.message.reply_text(
-            format_balances(res.get("balances", {})) or "Пока нет данных.",
-            parse_mode="HTML",
-        )
-    else:
-        await update.message.reply_text("Не удалось получить балансы 😕")
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def day_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         await update.message.reply_text("Доступ только для владельца бота.")
         return
-
-    text = update.message.text
-
-    # Голосовые (опционально)
-    if update.message.voice:
-        if not OPENAI_API_KEY:
-            await update.message.reply_text(
-                "Голосовые пока не подключены. Напиши операцию текстом "
-                "или добавь OPENAI_API_KEY (см. README)."
-            )
-            return
-        tg_file = await update.message.voice.get_file()
-        path = f"/tmp/{update.message.voice.file_id}.ogg"
-        await tg_file.download_to_drive(path)
-        text = transcribe_voice(path)
-        if not text:
-            await update.message.reply_text("Не смог расшифровать голосовое 😕")
-            return
-
+    user_id = str(update.effective_user.id)
+    notes = load_day(user_id, _today())
+    if not notes:
+        await update.message.reply_text("За сегодня пока нет заметок.")
+        return
+    await update.message.chat.send_action("typing")
     try:
-        parsed = parse_message(text)
+        digest = make_digest(notes)
     except Exception as e:
-        log.exception("parse error")
-        await update.message.reply_text(f"Не смог разобрать сообщение: {e}")
+        log.exception("digest error")
+        await update.message.reply_text(f"Не смог собрать сводку: {e}")
+        return
+    header = f"🗓 <b>Daily dollar balance — {_today()}</b> ({len(notes)} заметок)\n\n"
+    await update.message.reply_text(header + digest, parse_mode="HTML")
+
+
+async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        await update.message.reply_text("Доступ только для владельца бота.")
+        return
+    path = _day_path(str(update.effective_user.id), _today())
+    if os.path.exists(path):
+        os.remove(path)
+    await update.message.reply_text("Заметки за сегодня очищены.")
+
+
+async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        log.warning("Отказ в доступе: user_id=%s", update.effective_user.id)
+        await update.message.reply_text("Доступ только для владельца бота.")
         return
 
-    ops = parsed.get("operations", [])
-    if not ops:
-        await update.message.reply_text(parsed.get("note") or "Это не похоже на операцию.")
+    user_id = str(update.effective_user.id)
+    await update.message.chat.send_action("typing")
+
+    # Получаем текст: из голосового (Whisper) или напрямую.
+    if update.message.voice or update.message.audio:
+        media = update.message.voice or update.message.audio
+        tg_file = await media.get_file()
+        path = f"/tmp/{media.file_id}.ogg"
+        await tg_file.download_to_drive(path)
+        try:
+            transcript = transcribe_voice(path)
+        except Exception as e:
+            log.exception("transcribe error")
+            await update.message.reply_text(f"Не смог расшифровать голосовое: {e}")
+            return
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+        if not transcript:
+            await update.message.reply_text("Пустая расшифровка — попробуй ещё раз.")
+            return
+    else:
+        transcript = update.message.text or ""
+        if not transcript.strip():
+            return
+
+    # Структурируем.
+    try:
+        structured = structure_note(transcript)
+    except Exception as e:
+        log.exception("structure error")
+        await update.message.reply_text(f"Не смог обработать заметку: {e}")
         return
 
-    res = send_to_sheet(ops)
-    if not res.get("ok"):
-        await update.message.reply_text(f"Ошибка записи в таблицу: {res.get('error')}")
-        return
-
-    # Собираем подтверждение
-    lines = ["✅ Записал:"]
-    for op in ops:
-        lines.append(
-            f"• {op['type']} {fmt(op['amount'])} {op['currency']}"
-            + (f" — {op['counterparty']}" if op.get("counterparty") else "")
-            + (f" ({op['comment']})" if op.get("comment") else "")
-        )
-    if parsed.get("note"):
-        lines.append(f"\nℹ️ {parsed['note']}")
-    lines.append(format_balances(res.get("balances", {})))
-
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    append_note(user_id, transcript, structured)
+    await update.message.reply_text(structured)
 
 
 def main():
+    if not ALLOWED_USER_IDS:
+        log.warning(
+            "ALLOWED_USER_ID не задан — бот НИКОГО не пустит. "
+            "Узнай свой id через /start и добавь его в переменные окружения."
+        )
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("balance", balance_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.VOICE, handle_text))
-    log.info("Бот запущен.")
+    app.add_handler(CommandHandler("day", day_cmd))
+    app.add_handler(CommandHandler("clear", clear_cmd))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_note))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_note))
+    log.info("Бот запущен (модель: %s).", MODEL)
     app.run_polling()
 
 
