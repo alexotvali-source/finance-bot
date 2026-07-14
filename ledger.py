@@ -29,6 +29,10 @@ EMPTY_LEDGER: dict = {
     },
     "assets": {},       # наши активы вне кошелька: название -> сумма
     "receivables": {},  # дебиторка (нам должны), тоже общая: имя -> сумма
+    # Журнал расходов. Рубли тут — ОПИСАНИЕ (как было сказано), по балансу бьют
+    # только доллары, списанные с рабочих средств. Поэтому баланс остаётся
+    # долларовым и не дрейфует от курса.
+    "expenses": [],
 }
 
 
@@ -66,6 +70,105 @@ def compute(ledger: dict) -> dict:
         # Наше (Ильи + Дмитрия). Дебиторка входит — наши деньги, просто у других.
         "our_assets": working + assets_total + receivables_total,
     }
+
+
+# ---------- Позиции: адресация путём "assets.Наличка" ----------
+def paths(ledger: dict) -> list[str]:
+    """Все существующие позиции. Скармливаем модели, чтобы она не выдумывала корзины."""
+    out = ["wallet.working"]
+    out += [f"wallet.held.{n}" for n in (ledger.get("wallet", {}).get("held") or {})]
+    out += [f"assets.{n}" for n in (ledger.get("assets") or {})]
+    out += [f"receivables.{n}" for n in (ledger.get("receivables") or {})]
+    return out
+
+
+def get(ledger: dict, path: str) -> float:
+    """Сумма позиции. Несуществующая позиция — это 0 (новый человек, новая корзина)."""
+    parts = path.split(".")
+    if parts == ["wallet", "working"]:
+        return _num(ledger.get("wallet", {}).get("working"))
+    if len(parts) == 3 and parts[0] == "wallet" and parts[1] == "held":
+        return _num((ledger.get("wallet", {}).get("held") or {}).get(parts[2]))
+    if len(parts) == 2 and parts[0] in ("assets", "receivables"):
+        return _num((ledger.get(parts[0]) or {}).get(parts[1]))
+    raise ValueError(f"неизвестный путь: {path}")
+
+
+def _set(ledger: dict, path: str, value: float) -> None:
+    parts = path.split(".")
+    if parts == ["wallet", "working"]:
+        ledger.setdefault("wallet", {})["working"] = value
+    elif len(parts) == 3 and parts[0] == "wallet" and parts[1] == "held":
+        ledger.setdefault("wallet", {}).setdefault("held", {})[parts[2]] = value
+    elif len(parts) == 2 and parts[0] in ("assets", "receivables"):
+        ledger.setdefault(parts[0], {})[parts[1]] = value
+    else:
+        raise ValueError(f"неизвестный путь: {path}")
+
+
+def label(path: str) -> str:
+    """Человеческое имя позиции."""
+    if path == "wallet.working":
+        return "Рабочие средства"
+    parts = path.split(".")
+    if len(parts) == 3:
+        return f"{parts[2]} (без задания)"
+    if parts[0] == "receivables":
+        return f"{parts[1]} (долг нам)"
+    return parts[1]
+
+
+def apply(ledger: dict, changes: list, today: str) -> dict:
+    """Применяет изменения, возвращая НОВЫЙ реестр. Исходный не трогает."""
+    new = json.loads(json.dumps(ledger))
+    for c in changes:
+        path = c["path"]
+        _set(new, path, get(new, path) + _num(c.get("amount")))
+    # Позиции, ушедшие в ноль, убираем — чтобы реестр не зарастал нулями.
+    for bucket in ("assets", "receivables"):
+        for name in [k for k, v in (new.get(bucket) or {}).items() if _num(v) == 0]:
+            del new[bucket][name]
+    held = new.get("wallet", {}).get("held") or {}
+    for name in [k for k, v in held.items() if _num(v) == 0]:
+        del held[name]
+    new["updated_at"] = today
+    return new
+
+
+def net_external(changes: list) -> float:
+    """Сколько денег втекает извне (+) или утекает наружу (-).
+
+    Если сумма изменений не ноль — деньги пересекли границу системы. Само по себе
+    это законно (приход, оплата), но должно быть НАЗВАНО вслух: именно так молча
+    исчезли 1 258 196 у Макса.
+    """
+    return sum(_num(c.get("amount")) for c in changes)
+
+
+def format_preview(before: dict, changes: list, summary: str, today: str) -> str:
+    """Что именно изменится. Показываем до применения — тут ловятся ошибки."""
+    after = apply(before, changes, today)
+    tb, ta = compute(before), compute(after)
+    lines = [f"📝 <b>{summary}</b>\n"]
+
+    for c in changes:
+        p = c["path"]
+        lines.append(f"• {label(p)}: {fmt(get(before, p))} → <b>{fmt(get(after, p))}</b> {CURRENCY}")
+
+    net = net_external(changes)
+    if net > 0:
+        lines.append(f"\n⬅️ <b>Извне приходит {fmt(net)} {CURRENCY}</b>")
+    elif net < 0:
+        lines.append(f"\n➡️ <b>Наружу уходит {fmt(-net)} {CURRENCY}</b> — из системы, адреса нет")
+
+    for name, key in (("Наши активы", "our_assets"), ("Под управлением", "under_management")):
+        if round(tb[key]) != round(ta[key]):
+            d = ta[key] - tb[key]
+            sign = "+" if d > 0 else "−"
+            lines.append(f"\n{name}: {fmt(tb[key])} → <b>{fmt(ta[key])}</b>  ({sign}{fmt(abs(d))})")
+
+    lines.append("\nПрименяем? Ответь «да».")
+    return "\n".join(lines)
 
 
 # ---------- Форматирование ----------
@@ -106,6 +209,111 @@ def format_balance(ledger: dict, fmt_date=lambda s: s) -> str:
     )
     if ledger.get("updated_at"):
         lines.append(f"<i>обновлено: {fmt_date(ledger['updated_at'])}</i>")
+    return "\n".join(lines)
+
+
+# ---------- Расходы ----------
+def check_expense(rec: dict) -> list[str]:
+    """Проверяет запись расхода на сходимость. Считает Python, а не модель."""
+    problems = []
+    by_person = rec.get("by_person") or {}
+    parts_sum = sum(_num(v.get("rub")) for v in by_person.values())
+    total = _num(rec.get("total_rub"))
+    if by_person and round(parts_sum) != round(total):
+        problems.append(
+            f"разбивка по людям даёт {fmt(parts_sum)} ₽, а итого указано {fmt(total)} ₽"
+        )
+    covered = _num(rec.get("covered_by_profit_rub"))
+    paid_rub = _num((rec.get("paid_from_working") or {}).get("rub"))
+    if round(covered + paid_rub) != round(total):
+        problems.append(
+            f"покрыто прибылью {fmt(covered)} ₽ + оплачено с общих {fmt(paid_rub)} ₽ "
+            f"= {fmt(covered + paid_rub)} ₽, а итого {fmt(total)} ₽"
+        )
+    return problems
+
+
+def expense_rate(rec: dict) -> float | None:
+    """Курс, зашитый в саму запись. К балансу не применяется — только справка."""
+    p = rec.get("paid_from_working") or {}
+    rub, usd = _num(p.get("rub")), _num(p.get("usd"))
+    return rub / usd if usd else None
+
+
+def add_expense(ledger: dict, rec: dict, deduct: bool, today: str) -> dict:
+    """Кладёт расход в журнал. deduct=False — если доллары уже списаны раньше."""
+    new = json.loads(json.dumps(ledger))
+    new.setdefault("expenses", []).append(rec)
+    new["expenses"].sort(key=lambda r: r.get("date") or "")
+    if deduct:
+        usd = _num((rec.get("paid_from_working") or {}).get("usd"))
+        _set(new, "wallet.working", get(new, "wallet.working") - usd)
+    new["updated_at"] = today
+    return new
+
+
+def expense_totals(ledger: dict) -> dict:
+    """Накопительные итоги по журналу."""
+    rub_by_person: dict = {}
+    usd_by_person: dict = {}
+    total_rub = paid_usd = covered_rub = 0.0
+    for rec in ledger.get("expenses") or []:
+        for name, v in (rec.get("by_person") or {}).items():
+            rub_by_person[name] = rub_by_person.get(name, 0) + _num(v.get("rub"))
+            usd_by_person[name] = usd_by_person.get(name, 0) + _num(v.get("usd"))
+        total_rub += _num(rec.get("total_rub"))
+        covered_rub += _num(rec.get("covered_by_profit_rub"))
+        paid_usd += _num((rec.get("paid_from_working") or {}).get("usd"))
+    return {
+        "rub_by_person": rub_by_person,
+        "usd_by_person": usd_by_person,
+        "total_rub": total_rub,
+        "covered_rub": covered_rub,
+        "paid_usd": paid_usd,
+    }
+
+
+def format_expenses(ledger: dict, fmt_date=lambda s: s) -> str:
+    recs = ledger.get("expenses") or []
+    if not recs:
+        return "Расходов в журнале пока нет."
+    lines = ["🧾 <b>Расходы</b>"]
+    for rec in recs:
+        when = fmt_date(rec.get("date") or "")
+        period = rec.get("period")
+        head = f"\n<b>{when}</b>" + (f" — за {period}" if period else "")
+        lines.append(head)
+        if rec.get("note"):
+            lines.append(f"<i>{rec['note']}</i>")
+        for name, v in (rec.get("by_person") or {}).items():
+            bits = []
+            if _num(v.get("rub")):
+                bits.append(f"{fmt(v['rub'])} ₽")
+            if _num(v.get("usd")):
+                bits.append(f"{fmt(v['usd'])} $")
+            lines.append(f"• {name}: {' + '.join(bits)}")
+        lines.append(f"Итого: <b>{fmt(rec.get('total_rub'))} ₽</b>")
+        if _num(rec.get("covered_by_profit_rub")):
+            lines.append(f"Покрыто прибылью: {fmt(rec['covered_by_profit_rub'])} ₽")
+        p = rec.get("paid_from_working") or {}
+        if _num(p.get("usd")):
+            rate = expense_rate(rec)
+            rate_s = f" по {rate:.2f} ₽/$" if rate else ""
+            lines.append(
+                f"С рабочих средств: {fmt(p.get('rub'))} ₽ = <b>{fmt(p['usd'])} $</b>{rate_s}"
+            )
+
+    t = expense_totals(ledger)
+    lines.append("\n<b>Накопительно</b>")
+    for name in t["rub_by_person"]:
+        bits = []
+        if t["rub_by_person"].get(name):
+            bits.append(f"{fmt(t['rub_by_person'][name])} ₽")
+        if t["usd_by_person"].get(name):
+            bits.append(f"{fmt(t['usd_by_person'][name])} $")
+        lines.append(f"• {name}: {' + '.join(bits)}")
+    lines.append(f"Всего потрачено: <b>{fmt(t['total_rub'])} ₽</b>")
+    lines.append(f"Из них с рабочих средств: <b>{fmt(t['paid_usd'])} $</b>")
     return "\n".join(lines)
 
 
@@ -163,4 +371,21 @@ SEED = {
         "Степан": 20_151,
         "Хасан": 20_000,
     },
+    # Операция 13.07 уже отражена в рабочих средствах (376 698 — это ПОСЛЕ неё),
+    # поэтому лежит здесь как история: повторно списывать нельзя.
+    "expenses": [
+        {
+            "date": "2026-07-13",
+            "period": "15.03–13.07",
+            "note": "Личные расходы Ильи и Дмитрия + общие",
+            "by_person": {
+                "Илья": {"rub": 2_951_930},
+                "Дмитрий": {"rub": 10_527_758},  # 5 986 658 + 4 541 100
+                "Общие": {"rub": 2_793_500},
+            },
+            "total_rub": 16_273_188,
+            "covered_by_profit_rub": 7_257_658,  # прибыль с других проектов, в кошелёк не заходила
+            "paid_from_working": {"rub": 9_015_530, "usd": 112_835},  # курс 79,90
+        }
+    ],
 }

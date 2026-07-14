@@ -429,6 +429,7 @@ def format_list(notes: list) -> str:
 
 # ---------- Кнопки ----------
 BTN_LEDGER = "📊 Реестр"
+BTN_EXPENSES = "🧾 Расходы"
 BTN_DAY = "🗓 Сводка дня"
 BTN_WEEK = "📅 За неделю"
 BTN_LIST = "📋 Список"
@@ -442,7 +443,7 @@ BTN_HELP = "❓ Помощь"
 # Ниже по смыслу: сводки / просмотр / поиск и правка / опасное и справка.
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [BTN_LEDGER],
+        [BTN_LEDGER, BTN_EXPENSES],
         [BTN_DAY, BTN_WEEK],
         [BTN_LIST, BTN_HISTORY],
         [BTN_FIND, BTN_UNDO],
@@ -452,7 +453,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 ALL_BUTTONS = {
-    BTN_LEDGER, BTN_DAY, BTN_WEEK, BTN_LIST,
+    BTN_LEDGER, BTN_EXPENSES, BTN_DAY, BTN_WEEK, BTN_LIST,
     BTN_HISTORY, BTN_FIND, BTN_UNDO, BTN_CLEAR, BTN_HELP,
 }
 
@@ -622,6 +623,8 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text == BTN_LEDGER:
         return await balance_cmd(update, context)
+    if text == BTN_EXPENSES:
+        return await expenses_cmd(update, context)
     if text == BTN_DAY:
         return await day_picker(update, context)
     if text == BTN_WEEK:
@@ -665,6 +668,19 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     book = ledger.load_or_seed(NOTES_DIR, str(update.effective_user.id))
     await update.message.reply_text(
         ledger.format_balance(book, _fmt_date),
+        parse_mode="HTML",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def expenses_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Журнал расходов: когда и сколько потрачено. Рубли — описание, доллары бьют по балансу."""
+    if not allowed(update):
+        await update.message.reply_text("Доступ только для владельца бота.")
+        return
+    book = ledger.load_or_seed(NOTES_DIR, str(update.effective_user.id))
+    await update.message.reply_text(
+        ledger.format_expenses(book, _fmt_date),
         parse_mode="HTML",
         reply_markup=MAIN_KEYBOARD,
     )
@@ -985,6 +1001,7 @@ async def _post_init(app: Application) -> None:
     await app.bot.set_my_commands(
         [
             BotCommand("balance", "📊 Реестр: балансы и итоги"),
+            BotCommand("expenses", "🧾 Журнал расходов"),
             BotCommand("day", "🗓 Сводка дня (можно /day 14-07-26)"),
             BotCommand("week", "📅 Сводка за 7 дней"),
             BotCommand("list", "📋 Записи за сегодня"),
@@ -1006,6 +1023,7 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("balance", balance_cmd))
+    app.add_handler(CommandHandler("expenses", expenses_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CommandHandler("day", day_cmd))
