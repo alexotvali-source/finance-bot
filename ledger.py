@@ -221,12 +221,17 @@ def check_expense(rec: dict) -> list[str]:
     """Проверяет запись расхода на сходимость. Считает Python, а не модель."""
     problems = []
     by_person = rec.get("by_person") or {}
-    parts_sum = sum(_num(v.get("rub")) for v in by_person.values())
+    # Валюты проверяем раздельно: запись может быть только рублёвой или только
+    # долларовой. Проверяем ту, по которой итог вообще заявлен.
+    for cur, key, sign in (("rub", "total_rub", "₽"), ("usd", "total_usd", "$")):
+        total = _num(rec.get(key))
+        parts_sum = sum(_num(v.get(cur)) for v in by_person.values())
+        if (total or parts_sum) and round(parts_sum) != round(total):
+            problems.append(
+                f"разбивка по людям даёт {fmt(parts_sum)} {sign}, "
+                f"а итого указано {fmt(total)} {sign}"
+            )
     total = _num(rec.get("total_rub"))
-    if by_person and round(parts_sum) != round(total):
-        problems.append(
-            f"разбивка по людям даёт {fmt(parts_sum)} ₽, а итого указано {fmt(total)} ₽"
-        )
     covered = _num(rec.get("covered_by_profit_rub"))
     paid_rub = _num((rec.get("paid_from_working") or {}).get("rub"))
     # Источник проверяем, только если про него вообще сказано: в записи может
@@ -262,20 +267,22 @@ def expense_totals(ledger: dict) -> dict:
     """Накопительные итоги по журналу."""
     rub_by_person: dict = {}
     usd_by_person: dict = {}
-    total_rub = paid_usd = covered_rub = 0.0
+    total_rub = total_usd = paid_usd = covered_rub = 0.0
     for rec in ledger.get("expenses") or []:
         for name, v in (rec.get("by_person") or {}).items():
             rub_by_person[name] = rub_by_person.get(name, 0) + _num(v.get("rub"))
             usd_by_person[name] = usd_by_person.get(name, 0) + _num(v.get("usd"))
         total_rub += _num(rec.get("total_rub"))
+        total_usd += _num(rec.get("total_usd"))
         covered_rub += _num(rec.get("covered_by_profit_rub"))
         paid_usd += _num((rec.get("paid_from_working") or {}).get("usd"))
     return {
         "rub_by_person": rub_by_person,
         "usd_by_person": usd_by_person,
         "total_rub": total_rub,
+        "total_usd": total_usd,      # потрачено в долларах (расход, а не списание с общих)
         "covered_rub": covered_rub,
-        "paid_usd": paid_usd,
+        "paid_usd": paid_usd,        # сколько ушло именно с рабочих средств
     }
 
 
@@ -298,7 +305,13 @@ def format_expenses(ledger: dict, fmt_date=lambda s: s) -> str:
             if _num(v.get("usd")):
                 bits.append(f"{fmt(v['usd'])} $")
             lines.append(f"• {name}: {' + '.join(bits)}")
-        lines.append(f"Итого: <b>{fmt(rec.get('total_rub'))} ₽</b>")
+        totals = []
+        if _num(rec.get("total_rub")):
+            totals.append(f"{fmt(rec['total_rub'])} ₽")
+        if _num(rec.get("total_usd")):
+            totals.append(f"{fmt(rec['total_usd'])} $")
+        if totals:
+            lines.append(f"Итого: <b>{' + '.join(totals)}</b>")
         if _num(rec.get("covered_by_profit_rub")):
             lines.append(f"Покрыто прибылью: {fmt(rec['covered_by_profit_rub'])} ₽")
         p = rec.get("paid_from_working") or {}
@@ -318,7 +331,12 @@ def format_expenses(ledger: dict, fmt_date=lambda s: s) -> str:
         if t["usd_by_person"].get(name):
             bits.append(f"{fmt(t['usd_by_person'][name])} $")
         lines.append(f"• {name}: {' + '.join(bits)}")
-    lines.append(f"Всего потрачено: <b>{fmt(t['total_rub'])} ₽</b>")
+    spent = []
+    if t["total_rub"]:
+        spent.append(f"{fmt(t['total_rub'])} ₽")
+    if t["total_usd"]:
+        spent.append(f"{fmt(t['total_usd'])} $")
+    lines.append(f"Всего потрачено: <b>{' + '.join(spent)}</b>")
     lines.append(f"Из них с рабочих средств: <b>{fmt(t['paid_usd'])} $</b>")
     return "\n".join(lines)
 
@@ -421,6 +439,18 @@ SEED = {
             "by_person": {"Илья": {"rub": 2_736_000}},
             "total_rub": 2_736_000,
             # Про источник (прибыль или общие) Илья не говорил — не выдумываем.
+        },
+        {
+            "date": "2026-07-12",
+            "period": "до 14.07",
+            "note": "Личные расходы в долларах за длительный период",
+            "by_person": {
+                "Илья": {"usd": 401_847},
+                "Дмитрий": {"usd": 250_635},
+            },
+            "total_usd": 652_482,
+            # Уже отражены в рабочих средствах (376 698 — это ПОСЛЕ них).
+            # Источник Илья не называл — не выдумываем.
         },
         {
             "date": "2026-07-13",
