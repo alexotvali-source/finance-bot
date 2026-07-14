@@ -37,6 +37,10 @@ EMPTY_LEDGER: dict = {
 
 
 def _num(x) -> float:
+    # Старый формат позиции — объект {"amount": N, "verified": ...}. Терпим его,
+    # иначе уже сохранённый реестр читается как сплошные нули.
+    if isinstance(x, dict):
+        x = x.get("amount")
     try:
         return float(x)
     except (TypeError, ValueError):
@@ -324,12 +328,29 @@ def _path(notes_dir: str, user_id: str) -> str:
     return os.path.join(d, "ledger.json")
 
 
+def migrate(book: dict) -> dict:
+    """Приводит реестр к текущей схеме. Нужна, потому что схема менялась поверх
+    уже сохранённого файла: позиция была {"amount": N, "verified": ...}, а корзина
+    чужих денег называлась "investors". Без этого старый файл читается как нули."""
+    wallet = book.get("wallet") or {}
+    wallet["working"] = _num(wallet.get("working"))
+    held = {k: _num(v) for k, v in (wallet.get("held") or {}).items()}
+    for name, v in (wallet.pop("investors", None) or {}).items():  # старое имя корзины
+        held[name] = _num(v)
+    wallet["held"] = held
+    book["wallet"] = wallet
+    for bucket in ("assets", "receivables"):
+        book[bucket] = {k: _num(v) for k, v in (book.get(bucket) or {}).items()}
+    book.setdefault("expenses", [])
+    return book
+
+
 def load(notes_dir: str, user_id: str) -> dict:
     p = _path(notes_dir, user_id)
     if not os.path.exists(p):
         return json.loads(json.dumps(EMPTY_LEDGER))
     with open(p, encoding="utf-8") as f:
-        return json.load(f)
+        return migrate(json.load(f))
 
 
 def save(notes_dir: str, user_id: str, ledger: dict) -> None:
@@ -338,9 +359,16 @@ def save(notes_dir: str, user_id: str, ledger: dict) -> None:
 
 
 def load_or_seed(notes_dir: str, user_id: str) -> dict:
-    """Первый запуск — кладём стартовые цифры. Дальше просто читаем."""
+    """Первый запуск — кладём стартовые цифры. Дальше читаем и, если файл в старой
+    схеме, лечим его на месте — чтобы миграция прошла один раз, а не при каждом чтении."""
     if os.path.exists(_path(notes_dir, user_id)):
-        return load(notes_dir, user_id)
+        book = load(notes_dir, user_id)
+        # Пустой реестр из старой схемы (все нули) — значит миграция потеряла данные
+        # или файл создался до заполнения. Заполняем стартовыми цифрами.
+        if compute(book)["wallet_total"] == 0 and not book.get("expenses"):
+            book = json.loads(json.dumps(SEED))
+        save(notes_dir, user_id, book)
+        return book
     seeded = json.loads(json.dumps(SEED))
     save(notes_dir, user_id, seeded)
     return seeded
