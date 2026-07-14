@@ -341,7 +341,11 @@ def migrate(book: dict) -> dict:
     book["wallet"] = wallet
     for bucket in ("assets", "receivables"):
         book[bucket] = {k: _num(v) for k, v in (book.get(bucket) or {}).items()}
-    book.setdefault("expenses", [])
+    # Файл мог быть создан до появления журнала расходов — тогда ключа нет вовсе,
+    # и стартовую запись надо доложить. Если ключ есть, но пуст, — расходы удалили
+    # осознанно, восстанавливать нельзя.
+    if "expenses" not in book:
+        book["expenses"] = json.loads(json.dumps(SEED["expenses"]))
     return book
 
 
