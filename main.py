@@ -17,6 +17,7 @@ Telegram-бот — голосовой ассистент для дневных 
 from __future__ import annotations
 
 import os
+import re
 import json
 import logging
 from datetime import datetime, timezone, timedelta
@@ -100,9 +101,12 @@ action:
 - "delete"     — удалить ОДНУ конкретную запись. target = её номер из списка.
 - "edit"       — исправить/переделать конкретную запись. target = номер, instruction = суть правки.
 - "delete_day" — удалить ВСЕ записи за какой-то день. date = дата в формате ГГГГ-ММ-ДД.
-- "note"       — обычная новая заметка (значение по умолчанию).
+- "note"       — обычная новая заметка (значение по умолчанию). Если в сообщении указана
+  дата, за какой день эта запись — верни её в date. Примеры: «14.06.26 внёс в сейф
+  наличные» → date = "2026-06-14"; «вчера забрал у Макса 250 000» → date = вчерашний день.
+  Если даты нет — date = null (запись пойдёт за сегодня).
 
-Как определить date для "delete_day" (ВСЕГДА возвращай ГГГГ-ММ-ДД, это внутренний формат):
+Как определить date (ВСЕГДА возвращай ГГГГ-ММ-ДД, это внутренний формат):
 - пользователь говорит день-месяц-год: "за 14-07-26" / "за 14-07-2026" / "за 14.07.26"
   → "2026-07-14". Первое число — ДЕНЬ, второе — МЕСЯЦ. Двузначный год 26 = 2026.
 - "за сегодня" → СЕГОДНЯ; "за вчера" → день до СЕГОДНЯ; "за 14 июля" → 14 июля текущего года.
@@ -116,7 +120,7 @@ action:
 
 Правила:
 - Командой считай только явные инструкции править/удалять запись(и). Простое описание
-  событий/фактов — это "note" (target и date null), даже если есть слова «удалил», «исправил».
+  событий/фактов — это "note", даже если есть слова «удалил», «исправил».
 - Для "edit" без конкретной правки instruction оставь пустым.
 - Сомневаешься — "note"."""
 
@@ -194,10 +198,30 @@ def looks_like_edit(text: str) -> bool:
     return has_target and has_verb
 
 
+# Дата в сообщении: цифрами (14.06.26) или словами («10 июня», «вчера») —
+# голосом дату чаще диктуют словами, поэтому одних цифр мало.
+_MONTHS = r"январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр"
+_DATE_RE = re.compile(
+    "|".join(
+        (
+            r"\d{1,2}\s*[.\-/]\s*\d{1,2}\s*[.\-/]\s*\d{2,4}",  # 14.06.26, 10-06-2026
+            r"\b(?:" + _MONTHS + r")",                          # «10 июня», «июня»
+            r"\b(?:вчера|позавчера|прошл)",                     # «вчера», «на прошлой неделе»
+        )
+    ),
+    re.IGNORECASE,
+)
+
+
+def looks_like_dated(text: str) -> bool:
+    """Похоже ли, что в сообщении указана дата (значит, запись может быть за прошлый день)."""
+    return bool(_DATE_RE.search(text))
+
+
 def route_message(text: str, notes: list) -> dict:
-    """Классифицирует сообщение: обычная заметка или команда правки/удаления записи.
-    Роутер видит нумерованный список записей, чтобы определить номер (target)."""
-    if not looks_like_edit(text):
+    """Классифицирует сообщение: заметка (возможно за прошлый день) или правка/удаление.
+    Роутер видит нумерованный список записей и сегодняшнюю дату."""
+    if not (looks_like_edit(text) or looks_like_dated(text)):
         return {"action": "note"}
     listing = format_list(notes) or "(записей нет)"
     user = (
@@ -314,8 +338,10 @@ def save_day(user_id: str, day: str, notes: list) -> None:
         json.dump(notes, f, ensure_ascii=False, indent=2)
 
 
-def append_note(user_id: str, transcript: str, structured: str) -> None:
-    day = _today()
+def append_note(user_id: str, transcript: str, structured: str, day: str | None = None) -> None:
+    """Добавляет запись в указанный день (по умолчанию сегодня).
+    ts — время внесения записи, а не события: для записи задним числом это нормально."""
+    day = day or _today()
     notes = load_day(user_id, day)
     notes.append(
         {
@@ -483,7 +509,8 @@ def allowed(update: Update) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 <b>Голосовой блокнот</b>\n"
-        "Надиктовывай голосовые — расшифрую, структурирую и дам выжимку.\n\n"
+        "Надиктовывай голосовые — расшифрую, структурирую и дам выжимку.\n"
+        "Назови дату — запишу задним числом: «10.06.26 забрал у Макса 250 000».\n\n"
         "🗓 <b>Сводки</b>\n"
         "Кнопка «Сводка дня» — предложит выбрать день\n"
         "/day — за сегодня (или <code>/day 14-07-26</code> за прошлый день)\n"
@@ -913,7 +940,12 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✏️ Обновил запись {num}:\n\n" + new_structured)
         return
 
-    # Обычная заметка — структурируем и сохраняем.
+    # Обычная заметка. Если в сообщении была дата — пишем в тот день, иначе в сегодня.
+    note_day = None
+    date = (route.get("date") or "").strip()
+    if _valid_date(date) and date != _today():
+        note_day = date
+
     try:
         structured = structure_note(transcript)
     except Exception as e:
@@ -921,8 +953,9 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Не смог обработать заметку: {e}")
         return
 
-    append_note(user_id, transcript, structured)
-    await update.message.reply_text(structured, reply_markup=MAIN_KEYBOARD)
+    append_note(user_id, transcript, structured, day=note_day)
+    prefix = f"📅 Записал за {_fmt_date(note_day)}:\n\n" if note_day else ""
+    await update.message.reply_text(prefix + structured, reply_markup=MAIN_KEYBOARD)
 
 
 async def _post_init(app: Application) -> None:
