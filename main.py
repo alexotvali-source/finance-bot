@@ -43,8 +43,11 @@ from telegram.ext import (
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]           # для расшифровки голосовых (Whisper)
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
 NOTES_DIR = os.environ.get("NOTES_DIR", "notes")
+
+# Модель зашита намеренно: переменная окружения могла бы молча подменить её
+# на более слабую. Бот всегда работает на Opus 4.8.
+MODEL = "claude-opus-4-8"
 
 # Доступ: список разрешённых Telegram user id (через запятую). Пусто => не пускаем никого.
 ALLOWED_USER_IDS = {
@@ -133,13 +136,18 @@ def transcribe_voice(file_path: str) -> str:
 
 
 # ---------- Модель ----------
-def _claude(system: str, user: str, max_tokens: int = 2048) -> str:
+def _claude(system: str, user: str, max_tokens: int = 4096) -> str:
+    # Адаптивное мышление: модель сама решает, сколько думать. Без него Opus 4.8
+    # склонен вписывать рассуждения прямо в видимый ответ — а он идёт в заметку.
+    # Лимит max_tokens покрывает мышление + ответ, поэтому он с запасом.
     resp = anthropic.messages.create(
         model=MODEL,
         max_tokens=max_tokens,
+        thinking={"type": "adaptive"},
         system=system,
         messages=[{"role": "user", "content": user}],
     )
+    # Берём только текстовые блоки — блоки мышления сюда не попадают.
     return "".join(b.text for b in resp.content if b.type == "text").strip()
 
 
@@ -198,7 +206,7 @@ def route_message(text: str, notes: list) -> dict:
         f"СООБЩЕНИЕ:\n{text}"
     )
     try:
-        data = _extract_json(_claude(ROUTER_PROMPT, user, max_tokens=300))
+        data = _extract_json(_claude(ROUTER_PROMPT, user, max_tokens=2048))
         if data.get("action") in ("delete", "edit", "delete_day", "note"):
             return data
     except Exception:
@@ -215,7 +223,7 @@ def make_digest(notes: list, label_dates: bool = False) -> str:
             else f"[{n.get('ts', '')}]"
         )
         parts.append(f"{prefix}\n{n['structured']}")
-    return _claude(DIGEST_PROMPT, "\n\n---\n\n".join(parts), max_tokens=3000)
+    return _claude(DIGEST_PROMPT, "\n\n---\n\n".join(parts), max_tokens=8000)
 
 
 # ---------- Хранение заметок по дням ----------
