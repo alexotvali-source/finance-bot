@@ -186,11 +186,12 @@ def route_message(text: str, notes: list) -> dict:
     return {"action": "note"}
 
 
-def make_digest(notes: list) -> str:
-    joined = "\n\n---\n\n".join(
-        f"[{n['ts']}]\n{n['structured']}" for n in notes
-    )
-    return _claude(DIGEST_PROMPT, joined, max_tokens=3000)
+def make_digest(notes: list, label_dates: bool = False) -> str:
+    parts = []
+    for n in notes:
+        prefix = f"[{n.get('date', '')} {n.get('ts', '')}]".strip() if label_dates else f"[{n.get('ts', '')}]"
+        parts.append(f"{prefix}\n{n['structured']}")
+    return _claude(DIGEST_PROMPT, "\n\n---\n\n".join(parts), max_tokens=3000)
 
 
 # ---------- Хранение заметок по дням ----------
@@ -210,6 +211,37 @@ def load_day(user_id: str, day: str) -> list:
         return []
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def list_days(user_id: str) -> list:
+    """Все даты (YYYY-MM-DD), за которые есть записи, по возрастанию."""
+    d = os.path.join(NOTES_DIR, str(user_id))
+    if not os.path.isdir(d):
+        return []
+    days = [f[:-5] for f in os.listdir(d) if f.endswith(".json") and _valid_date(f[:-5])]
+    return sorted(days)
+
+
+def load_range(user_id: str, days_back: int) -> list:
+    """Записи за последние days_back дней (каждой добавлено поле 'date')."""
+    today = datetime.now(timezone.utc).date()
+    result = []
+    for d in list_days(user_id):
+        dd = datetime.strptime(d, "%Y-%m-%d").date()
+        if 0 <= (today - dd).days < days_back:
+            for n in load_day(user_id, d):
+                n = dict(n)
+                n["date"] = d
+                result.append(n)
+    return result
+
+
+def _valid_date(s: str) -> bool:
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
 
 
 def save_day(user_id: str, day: str, notes: list) -> None:
@@ -312,7 +344,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "«исправь запись 3: сумма 500», «переделай предпоследнюю»\n"
         "• /list — показать записи за сегодня (с номерами)\n"
         "• /undo — удалить последнюю запись\n"
-        "• /day — сводная выжимка за день (её кладёшь в Cowork)\n"
+        "• /day — сводка за день (или /day ГГГГ-ММ-ДД за прошлый)\n"
+        "• /week — сводка за 7 дней\n"
+        "• /history — дни, за которые есть записи\n"
+        "• /find текст — поиск по всем записям\n"
         "• /clear — очистить заметки за сегодня\n\n"
         "Кнопки внизу — быстрый доступ к основным действиям.\n\n"
         f"Твой Telegram user id: <code>{update.effective_user.id}</code>",
@@ -367,9 +402,17 @@ async def day_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Доступ только для владельца бота.")
         return
     user_id = str(update.effective_user.id)
-    notes = load_day(user_id, _today())
+    args = context.args or []
+    day = _today()
+    if args:
+        if _valid_date(args[0]):
+            day = args[0]
+        else:
+            await update.message.reply_text("Дата в формате ГГГГ-ММ-ДД, например /day 2026-07-10")
+            return
+    notes = load_day(user_id, day)
     if not notes:
-        await update.message.reply_text("За сегодня пока нет заметок.")
+        await update.message.reply_text(f"За {day} записей нет.")
         return
     await update.message.chat.send_action("typing")
     try:
@@ -378,8 +421,68 @@ async def day_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("digest error")
         await update.message.reply_text(f"Не смог собрать сводку: {e}")
         return
-    header = f"🗓 <b>Daily dollar balance — {_today()}</b>\n\n"
+    header = f"🗓 <b>Daily dollar balance — {day}</b>\n\n"
     await update.message.reply_text(header + digest, parse_mode="HTML")
+
+
+async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        await update.message.reply_text("Доступ только для владельца бота.")
+        return
+    notes = load_range(str(update.effective_user.id), 7)
+    if not notes:
+        await update.message.reply_text("За последние 7 дней записей нет.")
+        return
+    await update.message.chat.send_action("typing")
+    try:
+        digest = make_digest(notes, label_dates=True)
+    except Exception as e:
+        log.exception("digest error")
+        await update.message.reply_text(f"Не смог собрать сводку: {e}")
+        return
+    header = f"🗓 <b>Сводка за 7 дней (по {_today()})</b>\n\n"
+    await update.message.reply_text(header + digest, parse_mode="HTML")
+
+
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        await update.message.reply_text("Доступ только для владельца бота.")
+        return
+    days = list_days(str(update.effective_user.id))
+    if not days:
+        await update.message.reply_text("История пуста.")
+        return
+    lines = ["📚 Дни с записями:"]
+    for d in sorted(days, reverse=True):
+        lines.append(f"• {d} — {len(load_day(str(update.effective_user.id), d))} зап.")
+    lines.append("\nПосмотреть день: /day ГГГГ-ММ-ДД")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        await update.message.reply_text("Доступ только для владельца бота.")
+        return
+    query = " ".join(context.args or []).strip()
+    if not query:
+        await update.message.reply_text("Что искать? Напиши, например: /find аренда")
+        return
+    q = query.lower()
+    user_id = str(update.effective_user.id)
+    matches = []
+    for d in sorted(list_days(user_id), reverse=True):
+        for n in load_day(user_id, d):
+            hay = ((n.get("transcript") or "") + " " + (n.get("structured") or "")).lower()
+            if q in hay:
+                matches.append(f"• {d} [{n.get('ts', '')}] {_first_line(n)}")
+                if len(matches) >= 20:
+                    break
+        if len(matches) >= 20:
+            break
+    if not matches:
+        await update.message.reply_text(f"Ничего не найдено по «{query}».")
+        return
+    await update.message.reply_text(f"🔎 Найдено по «{query}»:\n" + "\n".join(matches))
 
 
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -489,7 +592,10 @@ async def _post_init(app: Application) -> None:
         [
             BotCommand("list", "Список записей за сегодня"),
             BotCommand("undo", "Удалить последнюю запись"),
-            BotCommand("day", "Сводка дня для Cowork"),
+            BotCommand("day", "Сводка дня (можно /day ГГГГ-ММ-ДД)"),
+            BotCommand("week", "Сводка за 7 дней"),
+            BotCommand("history", "Дни с записями"),
+            BotCommand("find", "Поиск по записям: /find текст"),
             BotCommand("clear", "Очистить заметки за день"),
             BotCommand("start", "Помощь и мой ID"),
         ]
@@ -507,6 +613,9 @@ def main():
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CommandHandler("day", day_cmd))
+    app.add_handler(CommandHandler("week", week_cmd))
+    app.add_handler(CommandHandler("history", history_cmd))
+    app.add_handler(CommandHandler("find", find_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
     # Нажатия кнопок клавиатуры — до общего обработчика заметок.
     app.add_handler(MessageHandler(filters.Text({BTN_LIST, BTN_DAY, BTN_UNDO, BTN_CLEAR}), buttons))
