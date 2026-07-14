@@ -23,11 +23,18 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 from anthropic import Anthropic
-from telegram import Update, ReplyKeyboardMarkup, BotCommand
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    BotCommand,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -321,9 +328,9 @@ def _resolve_index(notes: list, target) -> int | None:
     return i - 1 if 1 <= i <= len(notes) else None
 
 
-def delete_at(user_id: str, target) -> dict | None:
-    """Удаляет запись по 1-based номеру за сегодня. Возвращает удалённую (или None)."""
-    day = _today()
+def delete_at(user_id: str, target, day: str | None = None) -> dict | None:
+    """Удаляет запись по 1-based номеру за указанный день (по умолчанию сегодня)."""
+    day = day or _today()
     notes = load_day(user_id, day)
     idx = _resolve_index(notes, target)
     if idx is None:
@@ -347,9 +354,10 @@ def delete_day(user_id: str, day: str) -> int:
     return count
 
 
-def replace_at(user_id: str, target, new_structured: str, instruction: str) -> dict | None:
-    """Заменяет структуру записи по 1-based номеру. Возвращает её (или None)."""
-    day = _today()
+def replace_at(user_id: str, target, new_structured: str, instruction: str,
+               day: str | None = None) -> dict | None:
+    """Заменяет структуру записи по 1-based номеру за указанный день. Возвращает её (или None)."""
+    day = day or _today()
     notes = load_day(user_id, day)
     idx = _resolve_index(notes, target)
     if idx is None:
@@ -408,6 +416,52 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 ALL_BUTTONS = {BTN_DAY, BTN_WEEK, BTN_LIST, BTN_HISTORY, BTN_FIND, BTN_UNDO, BTN_CLEAR, BTN_HELP}
 
 
+# ---------- Inline-клавиатуры (выбор дня и правка записей) ----------
+# В callback_data всегда кладём дату вместе с номером: список мог быть открыт вчера,
+# а нажат сегодня — по одному номеру попали бы не в ту запись.
+def _day_label(iso: str) -> str:
+    if iso == _today():
+        return "Сегодня"
+    if iso == (_now().date() - timedelta(days=1)).strftime("%Y-%m-%d"):
+        return "Вчера"
+    return _fmt_date(iso)
+
+
+def _days_keyboard(user_id: str, limit: int = 8) -> InlineKeyboardMarkup | None:
+    """Кнопки с днями, за которые есть записи (свежие сверху)."""
+    days = sorted(list_days(user_id), reverse=True)[:limit]
+    if not days:
+        return None
+    btns = [
+        InlineKeyboardButton(
+            f"{_day_label(d)} ({len(load_day(user_id, d))})", callback_data=f"day:{d}"
+        )
+        for d in days
+    ]
+    return InlineKeyboardMarkup([btns[i:i + 2] for i in range(0, len(btns), 2)])
+
+
+def _notes_keyboard(iso: str, notes: list) -> InlineKeyboardMarkup:
+    """Кнопки-номера записей: тапнул номер — увидишь запись и действия с ней."""
+    btns = [
+        InlineKeyboardButton(str(i), callback_data=f"note:{iso}:{i}")
+        for i in range(1, len(notes) + 1)
+    ]
+    return InlineKeyboardMarkup([btns[i:i + 5] for i in range(0, len(btns), 5)])
+
+
+def _note_actions(iso: str, num: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✏️ Изменить", callback_data=f"edit:{iso}:{num}"),
+                InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{iso}:{num}"),
+            ],
+            [InlineKeyboardButton("◀️ К списку", callback_data=f"list:{iso}")],
+        ]
+    )
+
+
 # ---------- Доступ ----------
 def allowed(update: Update) -> bool:
     # Fail-closed: если список пуст — не пускаем НИКОГО.
@@ -423,10 +477,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 <b>Голосовой блокнот</b>\n"
         "Надиктовывай голосовые — расшифрую, структурирую и дам выжимку.\n\n"
         "🗓 <b>Сводки</b>\n"
+        "Кнопка «Сводка дня» — предложит выбрать день\n"
         "/day — за сегодня (или <code>/day 14-07-26</code> за прошлый день)\n"
         "/week — за последние 7 дней\n\n"
         "📋 <b>Записи</b>\n"
-        "/list — записи за сегодня, с номерами\n"
+        "/list — записи за сегодня; нажми номер → ✏️ Изменить / 🗑 Удалить\n"
         "/history — дни, за которые есть записи\n"
         "/find текст — поиск по всем записям\n\n"
         "✏️ <b>Правка</b>\n"
@@ -443,11 +498,88 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _send_digest(message, user_id: str, iso: str) -> None:
+    notes = load_day(user_id, iso)
+    if not notes:
+        await message.reply_text(f"За {_fmt_date(iso)} записей нет.")
+        return
+    await message.chat.send_action("typing")
+    try:
+        digest = make_digest(notes)
+    except Exception as e:
+        log.exception("digest error")
+        await message.reply_text(f"Не смог собрать сводку: {e}")
+        return
+    await message.reply_text(
+        f"🗓 <b>Daily dollar balance — {_fmt_date(iso)}</b>\n\n" + digest, parse_mode="HTML"
+    )
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Нажатия inline-кнопок: выбор дня, просмотр записи, правка, удаление."""
+    q = update.callback_query
+    if not allowed(update):
+        await q.answer("Доступ только для владельца бота.", show_alert=True)
+        return
+    await q.answer()
+
+    user_id = str(update.effective_user.id)
+    parts = (q.data or "").split(":")
+    kind = parts[0]
+
+    if kind == "day":
+        await _send_digest(q.message, user_id, parts[1])
+        return
+
+    if kind == "list":
+        iso = parts[1]
+        notes = load_day(user_id, iso)
+        if not notes:
+            await q.message.reply_text(f"За {_fmt_date(iso)} записей нет.")
+            return
+        await q.message.reply_text(
+            f"Записи за {_fmt_date(iso)} ({len(notes)}):\n" + format_list(notes),
+            reply_markup=_notes_keyboard(iso, notes),
+        )
+        return
+
+    iso, num = parts[1], int(parts[2])
+    notes = load_day(user_id, iso)
+    idx = _resolve_index(notes, num)
+    if idx is None:
+        await q.message.reply_text("Этой записи уже нет — открой список заново.")
+        return
+
+    if kind == "note":
+        n = notes[idx]
+        await q.message.reply_text(
+            f"Запись {num} — {_fmt_date(iso)} [{n.get('ts', '')}]\n\n{n['structured']}",
+            reply_markup=_note_actions(iso, num),
+        )
+        return
+
+    if kind == "del":
+        removed = delete_at(user_id, num, day=iso)
+        await q.message.reply_text(
+            f"🗑 Удалил запись {num} за {_fmt_date(iso)}:\n\n{removed['structured']}\n\n"
+            "Можешь продиктовать заново."
+        )
+        return
+
+    if kind == "edit":
+        context.user_data["pending_edit"] = (iso, num)
+        await q.message.reply_text(
+            f"✏️ Что поправить в записи {num} за {_fmt_date(iso)}?\n"
+            "Напиши или надиктуй правку (или «отмена»)."
+        )
+        return
+
+
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Нажатия кнопок клавиатуры — вызывают соответствующие команды."""
     text = update.message.text
     if text == BTN_DAY:
-        return await day_cmd(update, context)
+        return await day_picker(update, context)
     if text == BTN_WEEK:
         return await week_cmd(update, context)
     if text == BTN_LIST:
@@ -468,13 +600,29 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         await update.message.reply_text("Доступ только для владельца бота.")
         return
-    notes = load_day(str(update.effective_user.id), _today())
+    day = _today()
+    notes = load_day(str(update.effective_user.id), day)
     if not notes:
         await update.message.reply_text("За сегодня пока нет заметок.")
         return
     await update.message.reply_text(
-        f"Записи за {_fmt_date(_today())} ({len(notes)}):\n" + format_list(notes)
+        f"Записи за {_fmt_date(day)} ({len(notes)}):\n"
+        + format_list(notes)
+        + "\n\nНажми номер, чтобы изменить или удалить запись.",
+        reply_markup=_notes_keyboard(day, notes),
     )
+
+
+async def day_picker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «Сводка дня» — предлагает выбрать день из тех, где есть записи."""
+    if not allowed(update):
+        await update.message.reply_text("Доступ только для владельца бота.")
+        return
+    kb = _days_keyboard(str(update.effective_user.id))
+    if kb is None:
+        await update.message.reply_text("Записей пока нет.")
+        return
+    await update.message.reply_text("🗓 За какой день собрать сводку?", reply_markup=kb)
 
 
 async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -663,6 +811,34 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_find(update, transcript.strip())
         return
 
+    # Ждём правку конкретной записи (нажата кнопка «✏️ Изменить»)?
+    pending_edit = context.user_data.pop("pending_edit", None)
+    if pending_edit:
+        iso, num = pending_edit
+        if _is_no(transcript):
+            await update.message.reply_text("Отменил правку.")
+            return
+        day_notes = load_day(user_id, iso)
+        idx = _resolve_index(day_notes, num)
+        if idx is None:
+            await update.message.reply_text("Этой записи уже нет.")
+            return
+        instruction = transcript.strip()
+        note = day_notes[idx]
+        try:
+            new_structured = restructure_with_correction(
+                note["transcript"], note["structured"], instruction
+            )
+        except Exception as e:
+            log.exception("edit error")
+            await update.message.reply_text(f"Не смог применить правку: {e}")
+            return
+        replace_at(user_id, num, new_structured, instruction, day=iso)
+        await update.message.reply_text(
+            f"✏️ Обновил запись {num} за {_fmt_date(iso)}:\n\n" + new_structured
+        )
+        return
+
     # Команда правки/удаления записи или обычная заметка?
     notes = load_day(user_id, _today())
     route = route_message(transcript, notes)
@@ -772,6 +948,8 @@ def main():
     app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("find", find_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
+    # Inline-кнопки: выбор дня, просмотр/правка/удаление записи.
+    app.add_handler(CallbackQueryHandler(on_callback))
     # Нажатия кнопок клавиатуры — до общего обработчика заметок.
     app.add_handler(MessageHandler(filters.Text(ALL_BUTTONS), buttons))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_note))
