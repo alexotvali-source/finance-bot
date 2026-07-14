@@ -78,20 +78,25 @@ DIGEST_PROMPT = """Тебе дают несколько структуриров
 - В самом верху — 2-3 строки итога дня.
 - Пиши по-русски, деловым и компактным стилем."""
 
-ROUTER_PROMPT = """Пользователь ведёт голосовые заметки. Определи намерение сообщения.
-Верни СТРОГО JSON: {"action": "...", "instruction": "..."}.
+ROUTER_PROMPT = """Пользователь ведёт нумерованные голосовые заметки за день.
+Тебе дают СПИСОК записей (номер + краткая выжимка) и новое СООБЩЕНИЕ.
+Определи намерение. Верни СТРОГО JSON: {"action": "...", "target": <номер|null>, "instruction": "..."}.
 
 action:
-- "delete_last" — просит удалить/убрать последнюю запись (возможно, чтобы продиктовать заново).
-- "edit_last"   — просит исправить/переделать последнюю запись. instruction = суть правки
-  (что именно изменить). Если конкретной правки в сообщении нет — instruction оставь пустым.
-- "note"        — обычная новая заметка, а не команда правки. Значение по умолчанию.
+- "delete" — удалить конкретную запись. target = её номер из списка.
+- "edit"   — исправить/переделать конкретную запись. target = номер, instruction = суть правки.
+- "note"   — обычная новая заметка (значение по умолчанию).
+
+Как определить target (номер записи из списка):
+- "последнюю" = последний номер; "предпоследнюю" = предпоследний.
+- "вторую запись" / "запись 2" = 2; "первую" = 1; и т.д.
+- можно ссылаться по смыслу: "исправь запись про аренду" → номер записи, где речь про аренду.
+- если это команда правки/удаления, но какую именно запись — непонятно, target = null.
 
 Правила:
-- Командой считай только явные инструкции о ПОСЛЕДНЕЙ/ПРЕДЫДУЩЕЙ записи, например
-  "удали последнюю запись", "переделай последнюю", "исправь в последней записи сумму на 500".
-- Если сообщение просто описывает события/факты — это "note", даже если в нём встречаются
-  слова «удалил», «последний», «исправил» и т.п.
+- Командой считай только явные инструкции править/удалять запись(и). Простое описание
+  событий/фактов — это "note" (target null), даже если есть слова «удалил», «исправил».
+- Для "edit" без конкретной правки instruction оставь пустым.
 - Сомневаешься — "note"."""
 
 
@@ -148,7 +153,12 @@ def looks_like_edit(text: str) -> bool:
     """Дешёвый пред-фильтр: похоже ли сообщение на команду правки записи.
     Если да — стоит спросить у модели-роутера; иначе это точно обычная заметка."""
     t = text.lower()
-    has_target = any(w in t for w in ("последн", "предыдущ", "запись", "заметк"))
+    has_target = any(
+        w in t
+        for w in ("последн", "предпоследн", "предыдущ", "запис", "заметк",
+                  "перв", "втор", "трет", "четверт", "пят", "шест", "седьм",
+                  "восьм", "девят", "десят")
+    ) or any(ch.isdigit() for ch in t)
     has_verb = any(
         w in t
         for w in ("удал", "убер", "сотри", "переделай", "пересоздай",
@@ -157,13 +167,16 @@ def looks_like_edit(text: str) -> bool:
     return has_target and has_verb
 
 
-def route_message(text: str) -> dict:
-    """Классифицирует сообщение: обычная заметка или команда правки. Консервативен."""
+def route_message(text: str, notes: list) -> dict:
+    """Классифицирует сообщение: обычная заметка или команда правки/удаления записи.
+    Роутер видит нумерованный список записей, чтобы определить номер (target)."""
     if not looks_like_edit(text):
         return {"action": "note"}
+    listing = format_list(notes) or "(записей нет)"
+    user = f"СПИСОК ЗАПИСЕЙ:\n{listing}\n\nСООБЩЕНИЕ:\n{text}"
     try:
-        data = _extract_json(_claude(ROUTER_PROMPT, text, max_tokens=300))
-        if data.get("action") in ("delete_last", "edit_last", "note"):
+        data = _extract_json(_claude(ROUTER_PROMPT, user, max_tokens=300))
+        if data.get("action") in ("delete", "edit", "note"):
             return data
     except Exception:
         log.exception("router error")
@@ -214,27 +227,56 @@ def append_note(user_id: str, transcript: str, structured: str) -> None:
     save_day(user_id, day, notes)
 
 
-def delete_last(user_id: str) -> dict | None:
-    """Удаляет последнюю запись за сегодня, возвращает её (или None, если пусто)."""
+def _resolve_index(notes: list, target) -> int | None:
+    """Переводит 1-based номер (может прийти строкой) в 0-based индекс или None."""
+    try:
+        i = int(target)
+    except (TypeError, ValueError):
+        return None
+    return i - 1 if 1 <= i <= len(notes) else None
+
+
+def delete_at(user_id: str, target) -> dict | None:
+    """Удаляет запись по 1-based номеру за сегодня. Возвращает удалённую (или None)."""
     day = _today()
     notes = load_day(user_id, day)
-    if not notes:
+    idx = _resolve_index(notes, target)
+    if idx is None:
         return None
-    removed = notes.pop()
+    removed = notes.pop(idx)
     save_day(user_id, day, notes)
     return removed
 
 
-def replace_last_structured(user_id: str, new_structured: str, instruction: str) -> dict | None:
-    """Заменяет структуру последней записи (после правки), возвращает её (или None)."""
+def delete_last(user_id: str) -> dict | None:
+    """Удобная обёртка для /undo — удаляет последнюю запись за сегодня."""
+    notes = load_day(user_id, _today())
+    return delete_at(user_id, len(notes)) if notes else None
+
+
+def replace_at(user_id: str, target, new_structured: str, instruction: str) -> dict | None:
+    """Заменяет структуру записи по 1-based номеру. Возвращает её (или None)."""
     day = _today()
     notes = load_day(user_id, day)
-    if not notes:
+    idx = _resolve_index(notes, target)
+    if idx is None:
         return None
-    notes[-1]["structured"] = new_structured
-    notes[-1]["transcript"] += f"\n[правка] {instruction}"
+    notes[idx]["structured"] = new_structured
+    notes[idx]["transcript"] += f"\n[правка] {instruction}"
     save_day(user_id, day, notes)
-    return notes[-1]
+    return notes[idx]
+
+
+def _first_line(note: dict) -> str:
+    s = note.get("structured") or ""
+    return s.splitlines()[0] if s else ""
+
+
+def format_list(notes: list) -> str:
+    """Нумерованный список записей: '1. [12:30] 📝 выжимка'."""
+    return "\n".join(
+        f"{i}. [{n.get('ts', '')}] {_first_line(n)}" for i, n in enumerate(notes, 1)
+    )
 
 
 # ---------- Доступ ----------
@@ -251,8 +293,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Надиктовывай голосовые — я расшифрую, структурирую и дам выжимку.\n\n"
         "• голосовое или текст — заметка на сегодня\n"
-        "• «удали последнюю запись» / «исправь в последней записи …» — правка последней\n"
-        "• /list — показать записи за сегодня\n"
+        "• правка любой записи по номеру из /list: «удали вторую запись», "
+        "«исправь запись 3: сумма 500», «переделай предпоследнюю»\n"
+        "• /list — показать записи за сегодня (с номерами)\n"
         "• /undo — удалить последнюю запись\n"
         "• /day — сводная выжимка за день (её кладёшь в Cowork)\n"
         "• /clear — очистить заметки за сегодня\n\n"
@@ -269,11 +312,9 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not notes:
         await update.message.reply_text("За сегодня пока нет заметок.")
         return
-    lines = [f"Записи за {_today()} ({len(notes)}):"]
-    for i, n in enumerate(notes, 1):
-        summary = (n.get("structured") or "").splitlines()[0] if n.get("structured") else ""
-        lines.append(f"{i}. [{n.get('ts', '')}] {summary}")
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text(
+        f"Записи за {_today()} ({len(notes)}):\n" + format_list(notes)
+    )
 
 
 async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -353,46 +394,51 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not transcript.strip():
             return
 
-    # Команда правки или обычная заметка?
-    route = route_message(transcript)
+    # Команда правки/удаления записи или обычная заметка?
+    notes = load_day(user_id, _today())
+    route = route_message(transcript, notes)
     action = route.get("action", "note")
 
-    if action == "delete_last":
-        removed = delete_last(user_id)
-        if not removed:
-            await update.message.reply_text("Нечего удалять — за сегодня записей нет.")
-        else:
-            await update.message.reply_text(
-                "🗑 Удалил последнюю запись:\n\n"
-                + removed["structured"]
-                + "\n\nМожешь продиктовать заново."
-            )
-        return
-
-    if action == "edit_last":
-        notes = load_day(user_id, _today())
+    if action in ("delete", "edit"):
         if not notes:
-            await update.message.reply_text("Нет записей за сегодня, чтобы править.")
+            await update.message.reply_text("Нет записей за сегодня.")
             return
+        idx = _resolve_index(notes, route.get("target"))
+        if idx is None:
+            await update.message.reply_text(
+                "Не понял, какую запись " + ("удалить" if action == "delete" else "править")
+                + ". Вот список — уточни номер:\n\n" + format_list(notes)
+            )
+            return
+        num = idx + 1
+
+        if action == "delete":
+            removed = delete_at(user_id, num)
+            await update.message.reply_text(
+                f"🗑 Удалил запись {num}:\n\n{removed['structured']}\n\n"
+                "Можешь продиктовать заново."
+            )
+            return
+
+        # edit
         instruction = (route.get("instruction") or "").strip()
         if not instruction:
             await update.message.reply_text(
-                "Что именно поправить в последней записи? Напиши правку "
-                "(например «сумма была 500, а не 5000»), либо скажи «удали последнюю» "
-                "и продиктуй заново."
+                f"Что поправить в записи {num}? Напиши правку "
+                "(например «сумма была 500, а не 5000»)."
             )
             return
-        last = notes[-1]
+        note = notes[idx]
         try:
             new_structured = restructure_with_correction(
-                last["transcript"], last["structured"], instruction
+                note["transcript"], note["structured"], instruction
             )
         except Exception as e:
             log.exception("edit error")
             await update.message.reply_text(f"Не смог применить правку: {e}")
             return
-        replace_last_structured(user_id, new_structured, instruction)
-        await update.message.reply_text("✏️ Обновил последнюю запись:\n\n" + new_structured)
+        replace_at(user_id, num, new_structured, instruction)
+        await update.message.reply_text(f"✏️ Обновил запись {num}:\n\n" + new_structured)
         return
 
     # Обычная заметка — структурируем и сохраняем.
