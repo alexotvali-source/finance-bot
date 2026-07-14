@@ -23,6 +23,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 import requests
+import ledger
 from anthropic import Anthropic
 from telegram import (
     Update,
@@ -427,6 +428,7 @@ def format_list(notes: list) -> str:
 
 
 # ---------- Кнопки ----------
+BTN_LEDGER = "📊 Реестр"
 BTN_DAY = "🗓 Сводка дня"
 BTN_WEEK = "📅 За неделю"
 BTN_LIST = "📋 Список"
@@ -436,9 +438,11 @@ BTN_UNDO = "↩️ Удалить последнюю"
 BTN_CLEAR = "🧹 Очистить день"
 BTN_HELP = "❓ Помощь"
 
-# Сгруппировано по смыслу: сводки / просмотр / поиск и правка / опасное и справка.
+# Реестр — наверху отдельной строкой: это главная цифра.
+# Ниже по смыслу: сводки / просмотр / поиск и правка / опасное и справка.
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
+        [BTN_LEDGER],
         [BTN_DAY, BTN_WEEK],
         [BTN_LIST, BTN_HISTORY],
         [BTN_FIND, BTN_UNDO],
@@ -447,7 +451,10 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-ALL_BUTTONS = {BTN_DAY, BTN_WEEK, BTN_LIST, BTN_HISTORY, BTN_FIND, BTN_UNDO, BTN_CLEAR, BTN_HELP}
+ALL_BUTTONS = {
+    BTN_LEDGER, BTN_DAY, BTN_WEEK, BTN_LIST,
+    BTN_HISTORY, BTN_FIND, BTN_UNDO, BTN_CLEAR, BTN_HELP,
+}
 
 
 # ---------- Inline-клавиатуры (выбор дня и правка записей) ----------
@@ -613,6 +620,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Нажатия кнопок клавиатуры — вызывают соответствующие команды."""
     text = update.message.text
+    if text == BTN_LEDGER:
+        return await balance_cmd(update, context)
     if text == BTN_DAY:
         return await day_picker(update, context)
     if text == BTN_WEEK:
@@ -645,6 +654,19 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + format_list(notes)
         + "\n\nНажми номер, чтобы изменить или удалить запись.",
         reply_markup=_notes_keyboard(day, notes),
+    )
+
+
+async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Реестр: кто чем владеет и сколько где лежит. Итоги считает Python, не модель."""
+    if not allowed(update):
+        await update.message.reply_text("Доступ только для владельца бота.")
+        return
+    book = ledger.load_or_seed(NOTES_DIR, str(update.effective_user.id))
+    await update.message.reply_text(
+        ledger.format_balance(book, _today(), _fmt_date),
+        parse_mode="HTML",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
@@ -962,6 +984,7 @@ async def _post_init(app: Application) -> None:
     """Регистрирует список команд — он показывается по кнопке «Menu» и по «/»."""
     await app.bot.set_my_commands(
         [
+            BotCommand("balance", "📊 Реестр: балансы и итоги"),
             BotCommand("day", "🗓 Сводка дня (можно /day 14-07-26)"),
             BotCommand("week", "📅 Сводка за 7 дней"),
             BotCommand("list", "📋 Записи за сегодня"),
@@ -982,6 +1005,7 @@ def main():
         )
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CommandHandler("day", day_cmd))
