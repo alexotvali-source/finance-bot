@@ -229,7 +229,9 @@ def check_expense(rec: dict) -> list[str]:
         )
     covered = _num(rec.get("covered_by_profit_rub"))
     paid_rub = _num((rec.get("paid_from_working") or {}).get("rub"))
-    if round(covered + paid_rub) != round(total):
+    # Источник проверяем, только если про него вообще сказано: в записи может
+    # стоять просто «потрачено столько-то», без указания, откуда деньги.
+    if (covered or paid_rub) and round(covered + paid_rub) != round(total):
         problems.append(
             f"покрыто прибылью {fmt(covered)} ₽ + оплачено с общих {fmt(paid_rub)} ₽ "
             f"= {fmt(covered + paid_rub)} ₽, а итого {fmt(total)} ₽"
@@ -341,12 +343,17 @@ def migrate(book: dict) -> dict:
     book["wallet"] = wallet
     for bucket in ("assets", "receivables"):
         book[bucket] = {k: _num(v) for k, v in (book.get(bucket) or {}).items()}
-    # Пустой журнал заполняем стартовой записью. Удалить расход из бота сейчас
-    # нельзя — команды нет, — поэтому пустота может быть только следствием того,
-    # что файл создан до появления журнала. Когда появится удаление расходов,
-    # это правило придётся пересмотреть: тогда пустота станет осмысленной.
-    if not book.get("expenses"):
-        book["expenses"] = json.loads(json.dumps(SEED["expenses"]))
+    # Доносим стартовые записи, которых ещё нет — сверяем по дате, чтобы правка
+    # доезжала и в уже непустой журнал (иначе новая стартовая запись не попадёт
+    # в файл, созданный прошлым деплоем). Удалить расход из бота сейчас нельзя —
+    # команды нет, — поэтому воскрешать нечего. Когда удаление появится,
+    # это правило придётся пересмотреть.
+    book.setdefault("expenses", [])
+    have = {r.get("date") for r in book["expenses"]}
+    for r in SEED["expenses"]:
+        if r.get("date") not in have:
+            book["expenses"].append(json.loads(json.dumps(r)))
+    book["expenses"].sort(key=lambda r: r.get("date") or "")
     return book
 
 
@@ -407,6 +414,14 @@ SEED = {
     # Операция 13.07 уже отражена в рабочих средствах (376 698 — это ПОСЛЕ неё),
     # поэтому лежит здесь как история: повторно списывать нельзя.
     "expenses": [
+        {
+            "date": "2026-03-14",
+            "period": "до 15.03",
+            "note": "Личные расходы Ильи до начала периода",
+            "by_person": {"Илья": {"rub": 2_736_000}},
+            "total_rub": 2_736_000,
+            # Про источник (прибыль или общие) Илья не говорил — не выдумываем.
+        },
         {
             "date": "2026-07-13",
             "period": "15.03–13.07",
