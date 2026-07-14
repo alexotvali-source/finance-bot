@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 from anthropic import Anthropic
@@ -195,8 +195,16 @@ def make_digest(notes: list, label_dates: bool = False) -> str:
 
 
 # ---------- Хранение заметок по дням ----------
+# Всё время — московское (UTC+3, перехода на летнее время в РФ нет с 2014).
+MSK = timezone(timedelta(hours=3), "MSK")
+
+
+def _now() -> datetime:
+    return datetime.now(MSK)
+
+
 def _today() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return _now().strftime("%Y-%m-%d")
 
 
 def _day_path(user_id: str, day: str) -> str:
@@ -224,7 +232,7 @@ def list_days(user_id: str) -> list:
 
 def load_range(user_id: str, days_back: int) -> list:
     """Записи за последние days_back дней (каждой добавлено поле 'date')."""
-    today = datetime.now(timezone.utc).date()
+    today = _now().date()
     result = []
     for d in list_days(user_id):
         dd = datetime.strptime(d, "%Y-%m-%d").date()
@@ -254,7 +262,7 @@ def append_note(user_id: str, transcript: str, structured: str) -> None:
     notes = load_day(user_id, day)
     notes.append(
         {
-            "ts": datetime.now(timezone.utc).strftime("%H:%M"),
+            "ts": _now().strftime("%H:%M"),
             "transcript": transcript,
             "structured": structured,
         }
