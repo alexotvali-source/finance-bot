@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 
 import requests
 from anthropic import Anthropic
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -279,6 +279,18 @@ def format_list(notes: list) -> str:
     )
 
 
+# ---------- Кнопки ----------
+BTN_LIST = "📋 Список"
+BTN_DAY = "🗓 Сводка дня"
+BTN_UNDO = "↩️ Удалить последнюю"
+BTN_CLEAR = "🧹 Очистить день"
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [[BTN_LIST, BTN_DAY], [BTN_UNDO, BTN_CLEAR]],
+    resize_keyboard=True,
+)
+
+
 # ---------- Доступ ----------
 def allowed(update: Update) -> bool:
     # Fail-closed: если список пуст — не пускаем НИКОГО.
@@ -299,9 +311,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /undo — удалить последнюю запись\n"
         "• /day — сводная выжимка за день (её кладёшь в Cowork)\n"
         "• /clear — очистить заметки за сегодня\n\n"
+        "Кнопки внизу — быстрый доступ к основным действиям.\n\n"
         f"Твой Telegram user id: <code>{update.effective_user.id}</code>",
         parse_mode="HTML",
+        reply_markup=MAIN_KEYBOARD,
     )
+
+
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Нажатия кнопок клавиатуры — вызывают соответствующие команды."""
+    text = update.message.text
+    if text == BTN_LIST:
+        return await list_cmd(update, context)
+    if text == BTN_DAY:
+        return await day_cmd(update, context)
+    if text == BTN_UNDO:
+        return await undo_cmd(update, context)
+    if text == BTN_CLEAR:
+        return await clear_cmd(update, context)
 
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -450,7 +477,20 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     append_note(user_id, transcript, structured)
-    await update.message.reply_text(structured)
+    await update.message.reply_text(structured, reply_markup=MAIN_KEYBOARD)
+
+
+async def _post_init(app: Application) -> None:
+    """Регистрирует список команд — он показывается по кнопке «Menu» и по «/»."""
+    await app.bot.set_my_commands(
+        [
+            BotCommand("list", "Список записей за сегодня"),
+            BotCommand("undo", "Удалить последнюю запись"),
+            BotCommand("day", "Сводка дня для Cowork"),
+            BotCommand("clear", "Очистить заметки за день"),
+            BotCommand("start", "Помощь и мой ID"),
+        ]
+    )
 
 
 def main():
@@ -459,12 +499,14 @@ def main():
             "ALLOWED_USER_ID не задан — бот НИКОГО не пустит. "
             "Узнай свой id через /start и добавь его в переменные окружения."
         )
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CommandHandler("day", day_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
+    # Нажатия кнопок клавиатуры — до общего обработчика заметок.
+    app.add_handler(MessageHandler(filters.Text({BTN_LIST, BTN_DAY, BTN_UNDO, BTN_CLEAR}), buttons))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_note))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_note))
     log.info("Бот запущен (модель: %s).", MODEL)
