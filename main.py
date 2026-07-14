@@ -385,15 +385,27 @@ def format_list(notes: list) -> str:
 
 
 # ---------- Кнопки ----------
-BTN_LIST = "📋 Список"
 BTN_DAY = "🗓 Сводка дня"
+BTN_WEEK = "📅 За неделю"
+BTN_LIST = "📋 Список"
+BTN_HISTORY = "📚 История"
+BTN_FIND = "🔎 Поиск"
 BTN_UNDO = "↩️ Удалить последнюю"
 BTN_CLEAR = "🧹 Очистить день"
+BTN_HELP = "❓ Помощь"
 
+# Сгруппировано по смыслу: сводки / просмотр / поиск и правка / опасное и справка.
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [[BTN_LIST, BTN_DAY], [BTN_UNDO, BTN_CLEAR]],
+    [
+        [BTN_DAY, BTN_WEEK],
+        [BTN_LIST, BTN_HISTORY],
+        [BTN_FIND, BTN_UNDO],
+        [BTN_CLEAR, BTN_HELP],
+    ],
     resize_keyboard=True,
 )
+
+ALL_BUTTONS = {BTN_DAY, BTN_WEEK, BTN_LIST, BTN_HISTORY, BTN_FIND, BTN_UNDO, BTN_CLEAR, BTN_HELP}
 
 
 # ---------- Доступ ----------
@@ -408,20 +420,24 @@ def allowed(update: Update) -> bool:
 # ---------- Хендлеры ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Надиктовывай голосовые — я расшифрую, структурирую и дам выжимку.\n\n"
-        "• голосовое или текст — заметка на сегодня\n"
-        "• правка любой записи по номеру из /list: «удали вторую запись», "
-        "«исправь запись 3: сумма 500», «переделай предпоследнюю»\n"
-        "• /list — показать записи за сегодня (с номерами)\n"
-        "• /undo — удалить последнюю запись\n"
-        "• /day — сводка за день (или /day ДД-ММ-ГГ за прошлый)\n"
-        "• /week — сводка за 7 дней\n"
-        "• /history — дни, за которые есть записи\n"
-        "• /find текст — поиск по всем записям\n"
-        "• «удали все записи за 14-07-26» — удалить целый день (спрошу подтверждение)\n"
-        "• /clear — очистить сегодня (или /clear ДД-ММ-ГГ — любой день)\n\n"
-        "Кнопки внизу — быстрый доступ к основным действиям.\n\n"
-        f"Твой Telegram user id: <code>{update.effective_user.id}</code>",
+        "👋 <b>Голосовой блокнот</b>\n"
+        "Надиктовывай голосовые — расшифрую, структурирую и дам выжимку.\n\n"
+        "🗓 <b>Сводки</b>\n"
+        "/day — за сегодня (или <code>/day 14-07-26</code> за прошлый день)\n"
+        "/week — за последние 7 дней\n\n"
+        "📋 <b>Записи</b>\n"
+        "/list — записи за сегодня, с номерами\n"
+        "/history — дни, за которые есть записи\n"
+        "/find текст — поиск по всем записям\n\n"
+        "✏️ <b>Правка</b>\n"
+        "/undo — удалить последнюю запись\n"
+        "Голосом: «удали вторую запись», «исправь запись 3: сумма 500»\n\n"
+        "🧹 <b>Удаление дня</b>\n"
+        "/clear — сегодня (или <code>/clear 14-07-26</code> — любой день)\n"
+        "Голосом: «удали все записи за 14-07-26» — переспрошу подтверждение\n\n"
+        "Даты — в формате ДД-ММ-ГГ, время московское.\n"
+        "Кнопки внизу — быстрый доступ.\n\n"
+        f"Твой Telegram ID: <code>{update.effective_user.id}</code>",
         parse_mode="HTML",
         reply_markup=MAIN_KEYBOARD,
     )
@@ -430,14 +446,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Нажатия кнопок клавиатуры — вызывают соответствующие команды."""
     text = update.message.text
-    if text == BTN_LIST:
-        return await list_cmd(update, context)
     if text == BTN_DAY:
         return await day_cmd(update, context)
+    if text == BTN_WEEK:
+        return await week_cmd(update, context)
+    if text == BTN_LIST:
+        return await list_cmd(update, context)
+    if text == BTN_HISTORY:
+        return await history_cmd(update, context)
+    if text == BTN_FIND:
+        return await find_cmd(update, context)
     if text == BTN_UNDO:
         return await undo_cmd(update, context)
     if text == BTN_CLEAR:
         return await clear_cmd(update, context)
+    if text == BTN_HELP:
+        return await start(update, context)
 
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -530,30 +554,39 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
-async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        await update.message.reply_text("Доступ только для владельца бота.")
-        return
-    query = " ".join(context.args or []).strip()
-    if not query:
-        await update.message.reply_text("Что искать? Напиши, например: /find аренда")
-        return
+def _search(user_id: str, query: str, limit: int = 20) -> list:
+    """Ищет подстроку по всем записям за все дни. Возвращает готовые строки."""
     q = query.lower()
-    user_id = str(update.effective_user.id)
     matches = []
     for d in sorted(list_days(user_id), reverse=True):
         for n in load_day(user_id, d):
             hay = ((n.get("transcript") or "") + " " + (n.get("structured") or "")).lower()
             if q in hay:
                 matches.append(f"• {_fmt_date(d)} [{n.get('ts', '')}] {_first_line(n)}")
-                if len(matches) >= 20:
-                    break
-        if len(matches) >= 20:
-            break
+                if len(matches) >= limit:
+                    return matches
+    return matches
+
+
+async def _reply_find(update: Update, query: str) -> None:
+    matches = _search(str(update.effective_user.id), query)
     if not matches:
         await update.message.reply_text(f"Ничего не найдено по «{query}».")
         return
     await update.message.reply_text(f"🔎 Найдено по «{query}»:\n" + "\n".join(matches))
+
+
+async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        await update.message.reply_text("Доступ только для владельца бота.")
+        return
+    query = " ".join(context.args or []).strip()
+    if not query:
+        # Нажата кнопка «Поиск» или /find без аргумента — спросим запрос следующим сообщением.
+        context.user_data["pending_find"] = True
+        await update.message.reply_text("🔎 Что искать? Напиши слово или фразу (или «отмена»).")
+        return
+    await _reply_find(update, query)
 
 
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -621,6 +654,14 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         # Ответ не про подтверждение: отменяем удаление и обрабатываем как обычно.
         await update.message.reply_text(f"Отменил удаление за {_fmt_date(pending)}.")
+
+    # Ждём поисковый запрос (нажата кнопка «Поиск»)?
+    if context.user_data.pop("pending_find", None):
+        if _is_no(transcript):
+            await update.message.reply_text("Отменил поиск.")
+            return
+        await _reply_find(update, transcript.strip())
+        return
 
     # Команда правки/удаления записи или обычная заметка?
     notes = load_day(user_id, _today())
@@ -704,14 +745,14 @@ async def _post_init(app: Application) -> None:
     """Регистрирует список команд — он показывается по кнопке «Menu» и по «/»."""
     await app.bot.set_my_commands(
         [
-            BotCommand("list", "Список записей за сегодня"),
-            BotCommand("undo", "Удалить последнюю запись"),
-            BotCommand("day", "Сводка дня (можно /day ДД-ММ-ГГ)"),
-            BotCommand("week", "Сводка за 7 дней"),
-            BotCommand("history", "Дни с записями"),
-            BotCommand("find", "Поиск по записям: /find текст"),
-            BotCommand("clear", "Очистить день (можно /clear ДД-ММ-ГГ)"),
-            BotCommand("start", "Помощь и мой ID"),
+            BotCommand("day", "🗓 Сводка дня (можно /day 14-07-26)"),
+            BotCommand("week", "📅 Сводка за 7 дней"),
+            BotCommand("list", "📋 Записи за сегодня"),
+            BotCommand("history", "📚 Дни с записями"),
+            BotCommand("find", "🔎 Поиск по записям"),
+            BotCommand("undo", "↩️ Удалить последнюю запись"),
+            BotCommand("clear", "🧹 Очистить день (можно /clear 14-07-26)"),
+            BotCommand("start", "❓ Помощь"),
         ]
     )
 
@@ -732,7 +773,7 @@ def main():
     app.add_handler(CommandHandler("find", find_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
     # Нажатия кнопок клавиатуры — до общего обработчика заметок.
-    app.add_handler(MessageHandler(filters.Text({BTN_LIST, BTN_DAY, BTN_UNDO, BTN_CLEAR}), buttons))
+    app.add_handler(MessageHandler(filters.Text(ALL_BUTTONS), buttons))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_note))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_note))
     log.info("Бот запущен (модель: %s).", MODEL)
