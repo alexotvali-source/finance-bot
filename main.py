@@ -92,8 +92,9 @@ action:
 - "delete_day" — удалить ВСЕ записи за какой-то день. date = дата в формате ГГГГ-ММ-ДД.
 - "note"       — обычная новая заметка (значение по умолчанию).
 
-Как определить date для "delete_day":
-- "за 14-07-2026" / "за 14.07.2026" → "2026-07-14" (перевести в ГГГГ-ММ-ДД).
+Как определить date для "delete_day" (ВСЕГДА возвращай ГГГГ-ММ-ДД, это внутренний формат):
+- пользователь говорит день-месяц-год: "за 14-07-26" / "за 14-07-2026" / "за 14.07.26"
+  → "2026-07-14". Первое число — ДЕНЬ, второе — МЕСЯЦ. Двузначный год 26 = 2026.
 - "за сегодня" → СЕГОДНЯ; "за вчера" → день до СЕГОДНЯ; "за 14 июля" → 14 июля текущего года.
 - если день понять невозможно — date = null.
 
@@ -201,7 +202,11 @@ def route_message(text: str, notes: list) -> dict:
 def make_digest(notes: list, label_dates: bool = False) -> str:
     parts = []
     for n in notes:
-        prefix = f"[{n.get('date', '')} {n.get('ts', '')}]".strip() if label_dates else f"[{n.get('ts', '')}]"
+        prefix = (
+            f"[{_fmt_date(n.get('date', ''))} {n.get('ts', '')}]".strip()
+            if label_dates
+            else f"[{n.get('ts', '')}]"
+        )
         parts.append(f"{prefix}\n{n['structured']}")
     return _claude(DIGEST_PROMPT, "\n\n---\n\n".join(parts), max_tokens=3000)
 
@@ -257,11 +262,36 @@ def load_range(user_id: str, days_back: int) -> list:
 
 
 def _valid_date(s: str) -> bool:
+    """Проверяет внутренний формат ISO (ГГГГ-ММ-ДД) — так называются файлы дней."""
     try:
         datetime.strptime(s, "%Y-%m-%d")
         return True
     except ValueError:
         return False
+
+
+# Внутри даты всегда ISO (ГГГГ-ММ-ДД): так имена файлов сортируются по хронологии.
+# Пользователь же видит и вводит ДД-ММ-ГГ.
+_INPUT_DATE_FORMATS = ("%d-%m-%y", "%d-%m-%Y", "%d.%m.%y", "%d.%m.%Y", "%Y-%m-%d")
+
+
+def _parse_date(s: str) -> str | None:
+    """Дата от пользователя (ДД-ММ-ГГ, ДД.ММ.ГГГГ, ...) -> внутренний ISO или None."""
+    s = s.strip()
+    for fmt in _INPUT_DATE_FORMATS:
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
+def _fmt_date(iso: str) -> str:
+    """Внутренний ISO -> ДД-ММ-ГГ для показа пользователю."""
+    try:
+        return datetime.strptime(iso, "%Y-%m-%d").strftime("%d-%m-%y")
+    except ValueError:
+        return iso
 
 
 def save_day(user_id: str, day: str, notes: list) -> None:
@@ -384,12 +414,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "«исправь запись 3: сумма 500», «переделай предпоследнюю»\n"
         "• /list — показать записи за сегодня (с номерами)\n"
         "• /undo — удалить последнюю запись\n"
-        "• /day — сводка за день (или /day ГГГГ-ММ-ДД за прошлый)\n"
+        "• /day — сводка за день (или /day ДД-ММ-ГГ за прошлый)\n"
         "• /week — сводка за 7 дней\n"
         "• /history — дни, за которые есть записи\n"
         "• /find текст — поиск по всем записям\n"
-        "• «удали все записи за 14-07-2026» — удалить целый день (спрошу подтверждение)\n"
-        "• /clear — очистить сегодня (или /clear ГГГГ-ММ-ДД — любой день)\n\n"
+        "• «удали все записи за 14-07-26» — удалить целый день (спрошу подтверждение)\n"
+        "• /clear — очистить сегодня (или /clear ДД-ММ-ГГ — любой день)\n\n"
         "Кнопки внизу — быстрый доступ к основным действиям.\n\n"
         f"Твой Telegram user id: <code>{update.effective_user.id}</code>",
         parse_mode="HTML",
@@ -419,7 +449,7 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("За сегодня пока нет заметок.")
         return
     await update.message.reply_text(
-        f"Записи за {_today()} ({len(notes)}):\n" + format_list(notes)
+        f"Записи за {_fmt_date(_today())} ({len(notes)}):\n" + format_list(notes)
     )
 
 
@@ -446,14 +476,14 @@ async def day_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     day = _today()
     if args:
-        if _valid_date(args[0]):
-            day = args[0]
-        else:
-            await update.message.reply_text("Дата в формате ГГГГ-ММ-ДД, например /day 2026-07-10")
+        parsed = _parse_date(args[0])
+        if not parsed:
+            await update.message.reply_text("Дата в формате ДД-ММ-ГГ, например /day 14-07-26")
             return
+        day = parsed
     notes = load_day(user_id, day)
     if not notes:
-        await update.message.reply_text(f"За {day} записей нет.")
+        await update.message.reply_text(f"За {_fmt_date(day)} записей нет.")
         return
     await update.message.chat.send_action("typing")
     try:
@@ -462,7 +492,7 @@ async def day_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("digest error")
         await update.message.reply_text(f"Не смог собрать сводку: {e}")
         return
-    header = f"🗓 <b>Daily dollar balance — {day}</b>\n\n"
+    header = f"🗓 <b>Daily dollar balance — {_fmt_date(day)}</b>\n\n"
     await update.message.reply_text(header + digest, parse_mode="HTML")
 
 
@@ -481,7 +511,7 @@ async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("digest error")
         await update.message.reply_text(f"Не смог собрать сводку: {e}")
         return
-    header = f"🗓 <b>Сводка за 7 дней (по {_today()})</b>\n\n"
+    header = f"🗓 <b>Сводка за 7 дней (по {_fmt_date(_today())})</b>\n\n"
     await update.message.reply_text(header + digest, parse_mode="HTML")
 
 
@@ -495,8 +525,8 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = ["📚 Дни с записями:"]
     for d in sorted(days, reverse=True):
-        lines.append(f"• {d} — {len(load_day(str(update.effective_user.id), d))} зап.")
-    lines.append("\nПосмотреть день: /day ГГГГ-ММ-ДД")
+        lines.append(f"• {_fmt_date(d)} — {len(load_day(str(update.effective_user.id), d))} зап.")
+    lines.append("\nПосмотреть день: /day ДД-ММ-ГГ")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -515,7 +545,7 @@ async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for n in load_day(user_id, d):
             hay = ((n.get("transcript") or "") + " " + (n.get("structured") or "")).lower()
             if q in hay:
-                matches.append(f"• {d} [{n.get('ts', '')}] {_first_line(n)}")
+                matches.append(f"• {_fmt_date(d)} [{n.get('ts', '')}] {_first_line(n)}")
                 if len(matches) >= 20:
                     break
         if len(matches) >= 20:
@@ -533,16 +563,16 @@ async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     day = _today()
     if args:
-        if _valid_date(args[0]):
-            day = args[0]
-        else:
-            await update.message.reply_text("Дата в формате ГГГГ-ММ-ДД, например /clear 2026-07-14")
+        parsed = _parse_date(args[0])
+        if not parsed:
+            await update.message.reply_text("Дата в формате ДД-ММ-ГГ, например /clear 14-07-26")
             return
+        day = parsed
     count = delete_day(str(update.effective_user.id), day)
     if count == 0:
-        await update.message.reply_text(f"За {day} записей нет.")
+        await update.message.reply_text(f"За {_fmt_date(day)} записей нет.")
         return
-    await update.message.reply_text(f"🗑 Удалил все записи за {day} ({count} шт.).")
+    await update.message.reply_text(f"🗑 Удалил все записи за {_fmt_date(day)} ({count} шт.).")
 
 
 async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -582,13 +612,15 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending:
         if _is_yes(transcript):
             n = delete_day(user_id, pending)
-            await update.message.reply_text(f"🗑 Удалил все записи за {pending} ({n} шт.).")
+            await update.message.reply_text(
+                f"🗑 Удалил все записи за {_fmt_date(pending)} ({n} шт.)."
+            )
             return
         if _is_no(transcript):
-            await update.message.reply_text(f"Отменил — записи за {pending} на месте.")
+            await update.message.reply_text(f"Отменил — записи за {_fmt_date(pending)} на месте.")
             return
         # Ответ не про подтверждение: отменяем удаление и обрабатываем как обычно.
-        await update.message.reply_text(f"Отменил удаление за {pending}.")
+        await update.message.reply_text(f"Отменил удаление за {_fmt_date(pending)}.")
 
     # Команда правки/удаления записи или обычная заметка?
     notes = load_day(user_id, _today())
@@ -600,16 +632,16 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not _valid_date(date):
             await update.message.reply_text(
                 "Не понял, за какой день удалять. Скажи, например: "
-                "«удали все записи за 14-07-2026», или команду /clear ГГГГ-ММ-ДД"
+                "«удали все записи за 14-07-26», или команду /clear ДД-ММ-ГГ"
             )
             return
         count = len(load_day(user_id, date))
         if count == 0:
-            await update.message.reply_text(f"За {date} записей нет.")
+            await update.message.reply_text(f"За {_fmt_date(date)} записей нет.")
             return
         context.user_data["pending_delete_day"] = date
         await update.message.reply_text(
-            f"⚠️ Удалить ВСЕ записи за {date} ({count} шт.)? Отменить будет нельзя.\n"
+            f"⚠️ Удалить ВСЕ записи за {_fmt_date(date)} ({count} шт.)? Отменить будет нельзя.\n"
             "Ответь «да» для подтверждения."
         )
         return
@@ -674,11 +706,11 @@ async def _post_init(app: Application) -> None:
         [
             BotCommand("list", "Список записей за сегодня"),
             BotCommand("undo", "Удалить последнюю запись"),
-            BotCommand("day", "Сводка дня (можно /day ГГГГ-ММ-ДД)"),
+            BotCommand("day", "Сводка дня (можно /day ДД-ММ-ГГ)"),
             BotCommand("week", "Сводка за 7 дней"),
             BotCommand("history", "Дни с записями"),
             BotCommand("find", "Поиск по записям: /find текст"),
-            BotCommand("clear", "Очистить день (можно /clear ГГГГ-ММ-ДД)"),
+            BotCommand("clear", "Очистить день (можно /clear ДД-ММ-ГГ)"),
             BotCommand("start", "Помощь и мой ID"),
         ]
     )
