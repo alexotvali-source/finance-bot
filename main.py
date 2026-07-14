@@ -82,13 +82,20 @@ DIGEST_PROMPT = """Тебе дают заметки за один день. Со
 - Пиши по-русски, кратко и по делу."""
 
 ROUTER_PROMPT = """Пользователь ведёт нумерованные голосовые заметки за день.
-Тебе дают СПИСОК записей (номер + краткая выжимка) и новое СООБЩЕНИЕ.
-Определи намерение. Верни СТРОГО JSON: {"action": "...", "target": <номер|null>, "instruction": "..."}.
+Тебе дают СЕГОДНЯШНЮЮ дату, СПИСОК записей за сегодня (номер + краткая выжимка) и СООБЩЕНИЕ.
+Определи намерение. Верни СТРОГО JSON:
+{"action": "...", "target": <номер|null>, "instruction": "...", "date": "<ГГГГ-ММ-ДД|null>"}.
 
 action:
-- "delete" — удалить конкретную запись. target = её номер из списка.
-- "edit"   — исправить/переделать конкретную запись. target = номер, instruction = суть правки.
-- "note"   — обычная новая заметка (значение по умолчанию).
+- "delete"     — удалить ОДНУ конкретную запись. target = её номер из списка.
+- "edit"       — исправить/переделать конкретную запись. target = номер, instruction = суть правки.
+- "delete_day" — удалить ВСЕ записи за какой-то день. date = дата в формате ГГГГ-ММ-ДД.
+- "note"       — обычная новая заметка (значение по умолчанию).
+
+Как определить date для "delete_day":
+- "за 14-07-2026" / "за 14.07.2026" → "2026-07-14" (перевести в ГГГГ-ММ-ДД).
+- "за сегодня" → СЕГОДНЯ; "за вчера" → день до СЕГОДНЯ; "за 14 июля" → 14 июля текущего года.
+- если день понять невозможно — date = null.
 
 Как определить target (номер записи из списка):
 - "последнюю" = последний номер; "предпоследнюю" = предпоследний.
@@ -98,7 +105,7 @@ action:
 
 Правила:
 - Командой считай только явные инструкции править/удалять запись(и). Простое описание
-  событий/фактов — это "note" (target null), даже если есть слова «удалил», «исправил».
+  событий/фактов — это "note" (target и date null), даже если есть слова «удалил», «исправил».
 - Для "edit" без конкретной правки instruction оставь пустым.
 - Сомневаешься — "note"."""
 
@@ -159,6 +166,7 @@ def looks_like_edit(text: str) -> bool:
     has_target = any(
         w in t
         for w in ("последн", "предпоследн", "предыдущ", "запис", "заметк",
+                  "вчера", "сегодня", "день", "дня", "числ",
                   "перв", "втор", "трет", "четверт", "пят", "шест", "седьм",
                   "восьм", "девят", "десят")
     ) or any(ch.isdigit() for ch in t)
@@ -176,10 +184,14 @@ def route_message(text: str, notes: list) -> dict:
     if not looks_like_edit(text):
         return {"action": "note"}
     listing = format_list(notes) or "(записей нет)"
-    user = f"СПИСОК ЗАПИСЕЙ:\n{listing}\n\nСООБЩЕНИЕ:\n{text}"
+    user = (
+        f"СЕГОДНЯ: {_today()}\n\n"
+        f"СПИСОК ЗАПИСЕЙ ЗА СЕГОДНЯ:\n{listing}\n\n"
+        f"СООБЩЕНИЕ:\n{text}"
+    )
     try:
         data = _extract_json(_claude(ROUTER_PROMPT, user, max_tokens=300))
-        if data.get("action") in ("delete", "edit", "note"):
+        if data.get("action") in ("delete", "edit", "delete_day", "note"):
             return data
     except Exception:
         log.exception("router error")
@@ -297,6 +309,14 @@ def delete_last(user_id: str) -> dict | None:
     return delete_at(user_id, len(notes)) if notes else None
 
 
+def delete_day(user_id: str, day: str) -> int:
+    """Удаляет ВСЕ записи за указанный день. Возвращает, сколько удалено."""
+    count = len(load_day(user_id, day))
+    if count:
+        os.remove(_day_path(user_id, day))
+    return count
+
+
 def replace_at(user_id: str, target, new_structured: str, instruction: str) -> dict | None:
     """Заменяет структуру записи по 1-based номеру. Возвращает её (или None)."""
     day = _today()
@@ -308,6 +328,18 @@ def replace_at(user_id: str, target, new_structured: str, instruction: str) -> d
     notes[idx]["transcript"] += f"\n[правка] {instruction}"
     save_day(user_id, day, notes)
     return notes[idx]
+
+
+def _is_yes(text: str) -> bool:
+    return text.strip().lower().rstrip(".!") in {
+        "да", "ага", "ок", "окей", "давай", "подтверждаю", "удаляй", "yes", "y"
+    }
+
+
+def _is_no(text: str) -> bool:
+    return text.strip().lower().rstrip(".!") in {
+        "нет", "не", "отмена", "отмени", "не надо", "стоп", "no", "n"
+    }
 
 
 def _first_line(note: dict) -> str:
@@ -356,7 +388,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /week — сводка за 7 дней\n"
         "• /history — дни, за которые есть записи\n"
         "• /find текст — поиск по всем записям\n"
-        "• /clear — очистить заметки за сегодня\n\n"
+        "• «удали все записи за 14-07-2026» — удалить целый день (спрошу подтверждение)\n"
+        "• /clear — очистить сегодня (или /clear ГГГГ-ММ-ДД — любой день)\n\n"
         "Кнопки внизу — быстрый доступ к основным действиям.\n\n"
         f"Твой Telegram user id: <code>{update.effective_user.id}</code>",
         parse_mode="HTML",
@@ -497,10 +530,19 @@ async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         await update.message.reply_text("Доступ только для владельца бота.")
         return
-    path = _day_path(str(update.effective_user.id), _today())
-    if os.path.exists(path):
-        os.remove(path)
-    await update.message.reply_text("Заметки за сегодня очищены.")
+    args = context.args or []
+    day = _today()
+    if args:
+        if _valid_date(args[0]):
+            day = args[0]
+        else:
+            await update.message.reply_text("Дата в формате ГГГГ-ММ-ДД, например /clear 2026-07-14")
+            return
+    count = delete_day(str(update.effective_user.id), day)
+    if count == 0:
+        await update.message.reply_text(f"За {day} записей нет.")
+        return
+    await update.message.reply_text(f"🗑 Удалил все записи за {day} ({count} шт.).")
 
 
 async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -535,10 +577,42 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not transcript.strip():
             return
 
+    # Ждём подтверждения удаления целого дня?
+    pending = context.user_data.pop("pending_delete_day", None)
+    if pending:
+        if _is_yes(transcript):
+            n = delete_day(user_id, pending)
+            await update.message.reply_text(f"🗑 Удалил все записи за {pending} ({n} шт.).")
+            return
+        if _is_no(transcript):
+            await update.message.reply_text(f"Отменил — записи за {pending} на месте.")
+            return
+        # Ответ не про подтверждение: отменяем удаление и обрабатываем как обычно.
+        await update.message.reply_text(f"Отменил удаление за {pending}.")
+
     # Команда правки/удаления записи или обычная заметка?
     notes = load_day(user_id, _today())
     route = route_message(transcript, notes)
     action = route.get("action", "note")
+
+    if action == "delete_day":
+        date = (route.get("date") or "").strip()
+        if not _valid_date(date):
+            await update.message.reply_text(
+                "Не понял, за какой день удалять. Скажи, например: "
+                "«удали все записи за 14-07-2026», или команду /clear ГГГГ-ММ-ДД"
+            )
+            return
+        count = len(load_day(user_id, date))
+        if count == 0:
+            await update.message.reply_text(f"За {date} записей нет.")
+            return
+        context.user_data["pending_delete_day"] = date
+        await update.message.reply_text(
+            f"⚠️ Удалить ВСЕ записи за {date} ({count} шт.)? Отменить будет нельзя.\n"
+            "Ответь «да» для подтверждения."
+        )
+        return
 
     if action in ("delete", "edit"):
         if not notes:
@@ -604,7 +678,7 @@ async def _post_init(app: Application) -> None:
             BotCommand("week", "Сводка за 7 дней"),
             BotCommand("history", "Дни с записями"),
             BotCommand("find", "Поиск по записям: /find текст"),
-            BotCommand("clear", "Очистить заметки за день"),
+            BotCommand("clear", "Очистить день (можно /clear ГГГГ-ММ-ДД)"),
             BotCommand("start", "Помощь и мой ID"),
         ]
     )
