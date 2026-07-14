@@ -664,7 +664,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     book = ledger.load_or_seed(NOTES_DIR, str(update.effective_user.id))
     await update.message.reply_text(
-        ledger.format_balance(book, _today(), _fmt_date),
+        ledger.format_balance(book, _fmt_date),
         parse_mode="HTML",
         reply_markup=MAIN_KEYBOARD,
     )
