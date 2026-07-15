@@ -718,12 +718,41 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _read_ledger(update: Update, user_id: str):
+    """Читает реестр. При сбое таблицы честно говорит об этом и возвращает None:
+    показать устаревшую цифру хуже, чем не показать никакой."""
+    try:
+        return ledger.read(NOTES_DIR, user_id)
+    except Exception as e:
+        log.exception("ledger read error")
+        await update.message.reply_text(
+            f"⚠️ Не смог прочитать реестр из таблицы: {e}\n\n"
+            "Цифры не покажу — они могут быть устаревшими. Попробуй ещё раз."
+        )
+        return None
+
+
+async def _write_ledger(update: Update, user_id: str, book: dict) -> bool:
+    """Пишет реестр. Не смог — говорит прямо: изменение НЕ применено."""
+    try:
+        ledger.write(NOTES_DIR, user_id, book)
+        return True
+    except Exception as e:
+        log.exception("ledger write error")
+        await update.message.reply_text(
+            f"⚠️ Не смог записать в таблицу: {e}\n\nИзменение НЕ применено — реестр как был."
+        )
+        return False
+
+
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Реестр: кто чем владеет и сколько где лежит. Итоги считает Python, не модель."""
     if not allowed(update):
         await update.message.reply_text("Доступ только для владельца бота.")
         return
-    book = ledger.load_or_seed(NOTES_DIR, str(update.effective_user.id))
+    book = await _read_ledger(update, str(update.effective_user.id))
+    if book is None:
+        return
     await update.message.reply_text(
         ledger.format_balance(book, _fmt_date),
         parse_mode="HTML",
@@ -736,7 +765,9 @@ async def expenses_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         await update.message.reply_text("Доступ только для владельца бота.")
         return
-    book = ledger.load_or_seed(NOTES_DIR, str(update.effective_user.id))
+    book = await _read_ledger(update, str(update.effective_user.id))
+    if book is None:
+        return
     await update.message.reply_text(
         ledger.format_expenses(book, _fmt_date),
         parse_mode="HTML",
@@ -938,9 +969,12 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_ledger = context.user_data.pop("pending_ledger", None)
     if pending_ledger:
         if _is_yes(transcript):
-            book = ledger.load_or_seed(NOTES_DIR, user_id)
+            book = await _read_ledger(update, user_id)
+            if book is None:
+                return
             book = ledger.apply(book, pending_ledger, _today())
-            ledger.save(NOTES_DIR, user_id, book)
+            if not await _write_ledger(update, user_id, book):
+                return
             await update.message.reply_text(
                 "✅ Применил.\n\n" + ledger.format_balance(book, _fmt_date),
                 parse_mode="HTML",
@@ -1057,7 +1091,9 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Про деньги? Тогда это операция над реестром, а не заметка.
     if any(ch.isdigit() for ch in transcript):
-        book = ledger.load_or_seed(NOTES_DIR, user_id)
+        book = await _read_ledger(update, user_id)
+        if book is None:
+            return
         money = interpret_money(transcript, book)
         if money.get("is_money"):
             if money.get("question"):

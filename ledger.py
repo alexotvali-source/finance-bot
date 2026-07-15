@@ -409,6 +409,37 @@ def save(notes_dir: str, user_id: str, ledger: dict) -> None:
         json.dump(ledger, f, ensure_ascii=False, indent=2)
 
 
+def read(notes_dir: str, user_id: str) -> dict:
+    """Читает реестр из единственного источника правды.
+
+    Настроена таблица — правда в ней; при её сбое поднимаем ошибку, а НЕ
+    подставляем локальную копию: тихо устаревшая цифра опаснее честной ошибки.
+    Таблица не настроена — работаем на волюме, как раньше.
+    """
+    import sheet
+
+    if not sheet.enabled():
+        return load_or_seed(notes_dir, user_id)
+
+    book = sheet.load()  # SheetError уйдёт наверх — так и надо
+    if book is None:  # таблица пустая: первый запуск
+        book = json.loads(json.dumps(SEED))
+        sheet.save(book, backup_path=_path(notes_dir, user_id))
+        return book
+    book = migrate(book)
+    return book
+
+
+def write(notes_dir: str, user_id: str, book: dict) -> None:
+    """Пишет реестр в единственный источник правды."""
+    import sheet
+
+    if not sheet.enabled():
+        save(notes_dir, user_id, book)
+        return
+    sheet.save(book, backup_path=_path(notes_dir, user_id))
+
+
 def load_or_seed(notes_dir: str, user_id: str) -> dict:
     """Первый запуск — кладём стартовые цифры. Дальше читаем и, если файл в старой
     схеме, лечим его на месте — чтобы миграция прошла один раз, а не при каждом чтении."""
