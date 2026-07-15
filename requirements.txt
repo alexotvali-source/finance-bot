@@ -1,4 +1,6 @@
 python-telegram-bot==21.6
-anthropic==0.39.0
+# 0.39 не знает параметра thinking: адаптивное мышление падало с TypeError
+# прямо в обработке заметок. Нужна версия с ThinkingConfigAdaptiveParam.
+anthropic==0.116.0
 requests==2.32.3
-httpx==0.27.2
+httpx==0.28.1
