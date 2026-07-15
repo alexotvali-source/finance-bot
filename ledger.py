@@ -122,6 +122,22 @@ def label(path: str) -> str:
     return parts[1]
 
 
+def to_changes(ledger: dict, ops: dict) -> list:
+    """Превращает названные Ильёй остатки ("set") и изменения ("add") в дельты.
+
+    Вычитание делает Python, а не модель: модель только называет сумму, которую
+    услышала. Именно на арифметике и классификации она уже ошибалась.
+    """
+    changes = []
+    for item in ops.get("set") or []:
+        path = item["path"]
+        changes.append({"path": path, "amount": _num(item.get("amount")) - get(ledger, path)})
+    for item in ops.get("add") or []:
+        changes.append({"path": item["path"], "amount": _num(item.get("amount"))})
+    # Пустые изменения выкидываем: «Стефан 325 168», когда там уже 325 168, — не событие.
+    return [c for c in changes if round(c["amount"]) != 0]
+
+
 def apply(ledger: dict, changes: list, today: str) -> dict:
     """Применяет изменения, возвращая НОВЫЙ реестр. Исходный не трогает."""
     new = json.loads(json.dumps(ledger))
@@ -159,11 +175,13 @@ def format_preview(before: dict, changes: list, summary: str, today: str) -> str
         p = c["path"]
         lines.append(f"• {label(p)}: {fmt(get(before, p))} → <b>{fmt(get(after, p))}</b> {CURRENCY}")
 
+    # Внешний поток называем вслух, но НЕ требуем объяснений: рост рабочих средств —
+    # это прибыль, её источник Илья ведёт отдельно. Задача превью — показать, а не допросить.
     net = net_external(changes)
     if net > 0:
-        lines.append(f"\n⬅️ <b>Извне приходит {fmt(net)} {CURRENCY}</b>")
+        lines.append(f"\n⬅️ <b>Прирост: +{fmt(net)} {CURRENCY}</b>")
     elif net < 0:
-        lines.append(f"\n➡️ <b>Наружу уходит {fmt(-net)} {CURRENCY}</b> — из системы, адреса нет")
+        lines.append(f"\n➡️ <b>Ушло наружу: {fmt(-net)} {CURRENCY}</b>")
 
     for name, key in (("Наши активы", "our_assets"), ("Под управлением", "under_management")):
         if round(tb[key]) != round(ta[key]):

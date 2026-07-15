@@ -93,6 +93,46 @@ DIGEST_PROMPT = """Тебе дают заметки за один день. Со
 - Формат — простой маркированный список, без вводных фраз.
 - Пиши по-русски, кратко и по делу."""
 
+LEDGER_PROMPT = """Ты превращаешь фразу Ильи о деньгах в изменения реестра.
+Тебе дают ТЕКУЩИЙ РЕЕСТР (позиция: сумма) и СООБЩЕНИЕ.
+
+КАК ГОВОРИТ ИЛЬЯ: обычно он называет НОВЫЕ ОСТАТКИ, а не события.
+«Макс 200 000» = теперь у Макса 200 000. «Стефан 325 168, Вадим 80 000» = новые
+остатки этих позиций. Это "set" — просто передай названную сумму.
+Реже он говорит про изменение: «добавил наличкой 14 000» — это "add".
+
+Верни СТРОГО JSON:
+{
+  "is_money": true|false,
+  "summary": "<что происходит, одной строкой по-человечески>",
+  "set": [{"path": "<путь>", "amount": <НОВЫЙ остаток, как назвал Илья>}],
+  "add": [{"path": "<путь>", "amount": <изменение: + или ->}],
+  "question": "<если непонятно, о какой позиции речь — что спросить; иначе пусто>"
+}
+
+САМОЕ ВАЖНОЕ: НИКОГДА не считай разницу и не складывай сам. Для "set" просто
+передай названную сумму как есть. Вычитание, сложение и все итоги делает программа —
+у тебя на этом бывают ошибки, поэтому арифметика не твоя работа.
+
+ПУТИ (бери существующие; новое имя человека или актива — можно, просто новый путь):
+- wallet.working        — рабочие средства: общие свободные деньги Ильи и Дмитрия
+- wallet.held.<Имя>     — чужие деньги без задания, временно лежат у нас
+- assets.<Название>     — наши активы вне кошелька (Крипта, Наличка, Заморожено...)
+- receivables.<Имя>     — нам должны (дебиторка)
+
+ЧЕГО НЕ НАДО СПРАШИВАТЬ:
+- Откуда взялась прибыль. Рост рабочих средств — это прибыль, Илья ведёт её источник
+  отдельно и говорить о нём не будет. Просто прими новый остаток.
+- Куда ушли деньги при уменьшении, если он сам не сказал. Программа покажет изменение,
+  Илья увидит его глазами и решит сам.
+
+ЧТО СПРОСИТЬ (question) — только если непонятно САМО СООБЩЕНИЕ:
+- неясно, о какой позиции или о каком человеке речь;
+- сумма названа в рублях (реестр долларовый) — спроси, сколько это в долларах.
+
+Не про деньги (мысли, планы, встречи) — is_money: false, списки пустые.
+Сомневаешься — is_money: false."""
+
 ROUTER_PROMPT = """Пользователь ведёт нумерованные голосовые заметки за день.
 Тебе дают СЕГОДНЯШНЮЮ дату, СПИСОК записей за сегодня (номер + краткая выжимка) и СООБЩЕНИЕ.
 Определи намерение. Верни СТРОГО JSON:
@@ -217,6 +257,21 @@ _DATE_RE = re.compile(
 def looks_like_dated(text: str) -> bool:
     """Похоже ли, что в сообщении указана дата (значит, запись может быть за прошлый день)."""
     return bool(_DATE_RE.search(text))
+
+
+def interpret_money(text: str, book: dict) -> dict:
+    """Превращает фразу о деньгах в изменения реестра. Модель называет суммы,
+    арифметику (дельты, итоги) делает Python."""
+    current = "\n".join(f"{p}: {ledger.fmt(ledger.get(book, p))}" for p in ledger.paths(book))
+    user = f"ТЕКУЩИЙ РЕЕСТР:\n{current}\n\nСООБЩЕНИЕ:\n{text}"
+    try:
+        data = _extract_json(_claude(LEDGER_PROMPT, user, max_tokens=2048))
+    except Exception:
+        log.exception("ledger interpret error")
+        return {"is_money": False}
+    if not data.get("is_money"):
+        return {"is_money": False}
+    return data
 
 
 def route_message(text: str, notes: list) -> dict:
@@ -876,6 +931,25 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Ответ не про подтверждение: отменяем удаление и обрабатываем как обычно.
         await update.message.reply_text(f"Отменил удаление за {_fmt_date(pending)}.")
 
+    # Ждём подтверждения операции над реестром?
+    pending_ledger = context.user_data.pop("pending_ledger", None)
+    if pending_ledger:
+        if _is_yes(transcript):
+            book = ledger.load_or_seed(NOTES_DIR, user_id)
+            book = ledger.apply(book, pending_ledger, _today())
+            ledger.save(NOTES_DIR, user_id, book)
+            await update.message.reply_text(
+                "✅ Применил.\n\n" + ledger.format_balance(book, _fmt_date),
+                parse_mode="HTML",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+        if _is_no(transcript):
+            await update.message.reply_text("Отменил — реестр не тронут.")
+            return
+        # Ответ не про подтверждение: операцию отменяем, сообщение обрабатываем как обычно.
+        await update.message.reply_text("Отменил операцию — реестр не тронут.")
+
     # Ждём поисковый запрос (нажата кнопка «Поиск»)?
     if context.user_data.pop("pending_find", None):
         if _is_no(transcript):
@@ -977,6 +1051,26 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         replace_at(user_id, num, new_structured, instruction)
         await update.message.reply_text(f"✏️ Обновил запись {num}:\n\n" + new_structured)
         return
+
+    # Про деньги? Тогда это операция над реестром, а не заметка.
+    if any(ch.isdigit() for ch in transcript):
+        book = ledger.load_or_seed(NOTES_DIR, user_id)
+        money = interpret_money(transcript, book)
+        if money.get("is_money"):
+            if money.get("question"):
+                await update.message.reply_text(f"❓ {money['question']}")
+                return
+            changes = ledger.to_changes(book, money)
+            if not changes:
+                await update.message.reply_text("В реестре ничего не меняется — суммы те же.")
+                return
+            context.user_data["pending_ledger"] = changes
+            await update.message.reply_text(
+                ledger.format_preview(book, changes, money.get("summary") or "Изменение реестра",
+                                      _today()),
+                parse_mode="HTML",
+            )
+            return
 
     # Обычная заметка. Если в сообщении была дата — пишем в тот день, иначе в сегодня.
     note_day = None
