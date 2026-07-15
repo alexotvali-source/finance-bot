@@ -337,7 +337,6 @@ def format_expenses(ledger: dict, fmt_date=lambda s: s) -> str:
     if t["total_usd"]:
         spent.append(f"{fmt(t['total_usd'])} $")
     lines.append(f"Всего потрачено: <b>{' + '.join(spent)}</b>")
-    lines.append(f"Из них с рабочих средств: <b>{fmt(t['paid_usd'])} $</b>")
     return "\n".join(lines)
 
 
