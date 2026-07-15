@@ -63,15 +63,13 @@ def compute(ledger: dict) -> dict:
     receivables_total = sum(_num(v) for v in receivables.values())
 
     return {
-        "working": working,            # наши свободные деньги в кошельке
-        "held_total": held_total,      # чужие деньги без задания, лежат у нас
-        "wallet_total": wallet_total,  # весь кошелёк
+        "working": working,            # рабочий баланс: свободные деньги Ильи и Дмитрия
+        "held_total": held_total,      # в управлении: чужие деньги, лежат у нас
+        "wallet_total": wallet_total,  # весь операционный кошелёк
         "assets_total": assets_total,  # наши активы вне кошелька
         "receivables_total": receivables_total,
-        # Всё, что физически под нашим контролем. Дебиторка НЕ входит:
-        # этих денег у нас нет, распорядиться ими нельзя.
-        "under_management": wallet_total + assets_total,
         # Наше (Ильи + Дмитрия). Дебиторка входит — наши деньги, просто у других.
+        # Чужие деньги в управлении НЕ входят: они не наши.
         "our_assets": working + assets_total + receivables_total,
     }
 
@@ -113,10 +111,10 @@ def _set(ledger: dict, path: str, value: float) -> None:
 def label(path: str) -> str:
     """Человеческое имя позиции."""
     if path == "wallet.working":
-        return "Рабочие средства"
+        return "Рабочий баланс"
     parts = path.split(".")
     if len(parts) == 3:
-        return f"{parts[2]} (без задания)"
+        return f"{parts[2]} (в управлении)"
     if parts[0] == "receivables":
         return f"{parts[1]} (долг нам)"
     return parts[1]
@@ -183,7 +181,11 @@ def format_preview(before: dict, changes: list, summary: str, today: str) -> str
     elif net < 0:
         lines.append(f"\n➡️ <b>Ушло наружу: {fmt(-net)} {CURRENCY}</b>")
 
-    for name, key in (("Наши активы", "our_assets"), ("Под управлением", "under_management")):
+    for name, key in (
+        ("Рабочий баланс", "working"),
+        ("В управлении", "held_total"),
+        ("Наши активы", "our_assets"),
+    ):
         if round(tb[key]) != round(ta[key]):
             d = ta[key] - tb[key]
             sign = "+" if d > 0 else "−"
@@ -203,31 +205,33 @@ def format_balance(ledger: dict, fmt_date=lambda s: s) -> str:
     wallet = ledger.get("wallet") or {}
     lines = ["📊 <b>Реестр</b>"]
 
-    lines.append(f"\n💼 <b>Операционный кошелёк</b> — {fmt(t['wallet_total'])} {CURRENCY}")
-    lines.append(f"• Рабочие средства: {fmt(t['working'])} {CURRENCY}")
+    # Рабочий баланс — сюда приходит прибыль и отсюда уходят расходы.
+    lines.append(f"\n💼 <b>Рабочий баланс: {fmt(t['working'])} {CURRENCY}</b>")
 
     held = wallet.get("held") or {}
     if held:
-        lines.append(f"\n  <i>Без задания — лежат у нас, {fmt(t['held_total'])} {CURRENCY}</i>")
+        lines.append(
+            f"\n🤝 <b>В управлении — {fmt(t['held_total'])} {CURRENCY}</b> "
+            f"<i>(чужие деньги, лежат у нас)</i>"
+        )
         for name, amount in held.items():
             lines.append(f"• {name}: {fmt(amount)} {CURRENCY}")
 
     assets = ledger.get("assets") or {}
     if assets:
-        lines.append(f"\n💰 <b>Активы вне кошелька</b> — {fmt(t['assets_total'])} {CURRENCY}")
+        lines.append(f"\n💰 <b>Активы — {fmt(t['assets_total'])} {CURRENCY}</b>")
         for name, amount in assets.items():
             lines.append(f"• {name}: {fmt(amount)} {CURRENCY}")
 
     recv = ledger.get("receivables") or {}
     if recv:
-        lines.append(f"\n🤝 <b>Дебиторка</b> — {fmt(t['receivables_total'])} {CURRENCY}")
+        lines.append(f"\n📌 <b>Дебиторка — {fmt(t['receivables_total'])} {CURRENCY}</b>")
         for name, amount in recv.items():
             lines.append(f"• {name}: {fmt(amount)} {CURRENCY}")
 
     lines.append(
         f"\n<b>Наши активы (Илья + Дмитрий): {fmt(t['our_assets'])} {CURRENCY}</b>"
-        f"\n<b>Под управлением: {fmt(t['under_management'])} {CURRENCY}</b>"
-        f"\n<i>под управлением = кошелёк + активы, без дебиторки</i>"
+        f"\n<i>рабочий баланс + активы + дебиторка; чужие деньги не входят</i>"
     )
     if ledger.get("updated_at"):
         lines.append(f"<i>обновлено: {fmt_date(ledger['updated_at'])}</i>")
