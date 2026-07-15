@@ -114,6 +114,14 @@ LEDGER_PROMPT = """Ты превращаешь фразу Ильи о деньг
 передай названную сумму как есть. Вычитание, сложение и все итоги делает программа —
 у тебя на этом бывают ошибки, поэтому арифметика не твоя работа.
 
+НОВЫЕ ЛЮДИ — это нормально и бывает часто. Реестр в сообщении показан лишь для того,
+чтобы ты знал текущие суммы, а НЕ как список допустимых имён.
+- «нам внесли деньги партнёры: Иван 50 000, Пётр 30 000» → wallet.held.Иван = 50000
+  и wallet.held.Пётр = 30000, даже если этих имён в реестре нет. Просто новый путь.
+- «Сергей занёс 100 000» → wallet.held.Сергей.
+- НЕ отказывайся и НЕ задавай question только потому, что имени пока нет в реестре.
+  Имя названо — этого достаточно.
+
 ПУТИ (бери существующие; новое имя человека или актива — можно, просто новый путь):
 - wallet.working        — рабочий баланс: общие свободные деньги Ильи и Дмитрия.
   Сюда приходит прибыль и отсюда уходят расходы.
@@ -195,6 +203,11 @@ def _claude(system: str, user: str, max_tokens: int = 4096) -> str:
         system=system,
         messages=[{"role": "user", "content": user}],
     )
+    # Мышление считается в max_tokens и может съесть весь лимит: тогда ответ
+    # обрывается, текста нет — и раньше это молча превращалось в заметку.
+    # Пусть лучше падает громко.
+    if resp.stop_reason == "max_tokens":
+        raise RuntimeError(f"ответ обрезан лимитом токенов ({max_tokens})")
     # Берём только текстовые блоки — блоки мышления сюда не попадают.
     return "".join(b.text for b in resp.content if b.type == "text").strip()
 
@@ -264,17 +277,16 @@ def looks_like_dated(text: str) -> bool:
 
 def interpret_money(text: str, book: dict) -> dict:
     """Превращает фразу о деньгах в изменения реестра. Модель называет суммы,
-    арифметику (дельты, итоги) делает Python."""
+    арифметику (дельты, итоги) делает Python.
+
+    Ошибки НЕ глушим: раньше любой сбой молча возвращал is_money=False, и вместо
+    операции появлялась заметка — без единого намёка, что что-то пошло не так.
+    Пусть лучше бот скажет, что не смог.
+    """
     current = "\n".join(f"{p}: {ledger.fmt(ledger.get(book, p))}" for p in ledger.paths(book))
     user = f"ТЕКУЩИЙ РЕЕСТР:\n{current}\n\nСООБЩЕНИЕ:\n{text}"
-    try:
-        data = _extract_json(_claude(LEDGER_PROMPT, user, max_tokens=2048))
-    except Exception:
-        log.exception("ledger interpret error")
-        return {"is_money": False}
-    if not data.get("is_money"):
-        return {"is_money": False}
-    return data
+    # Лимит с запасом: мышление считается в него же.
+    return _extract_json(_claude(LEDGER_PROMPT, user, max_tokens=8000))
 
 
 def route_message(text: str, notes: list) -> dict:
@@ -1094,7 +1106,17 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         book = await _read_ledger(update, user_id)
         if book is None:
             return
-        money = interpret_money(transcript, book)
+        try:
+            money = interpret_money(transcript, book)
+        except Exception as e:
+            # Молчать нельзя: иначе вместо операции появится заметка, а Илья
+            # будет гадать, почему баланс не изменился.
+            log.exception("ledger interpret error")
+            await update.message.reply_text(
+                f"⚠️ Не смог разобрать операцию: {e}\n\n"
+                "Реестр не тронут. Скажи иначе или напиши текстом."
+            )
+            return
         if money.get("is_money"):
             if money.get("question"):
                 await update.message.reply_text(f"❓ {money['question']}")
