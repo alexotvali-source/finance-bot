@@ -28,6 +28,23 @@ function _secret() {
   return PropertiesService.getScriptProperties().getProperty('SHEET_SECRET') || '';
 }
 
+/**
+ * Fail-closed: секрет не задан — не пускаем НИКОГО.
+ * Без этой проверки незаданный секрет означал бы _secret() === '' и сравнение
+ * '' !== '' === false, то есть запрос БЕЗ секрета проходил бы. Веб-приложение
+ * развёрнуто с доступом «Все», так что это открыло бы реестр всему интернету.
+ */
+function _denied(e) {
+  var secret = _secret();
+  if (!secret) {
+    return _json({ ok: false, error: 'SHEET_SECRET не задан в свойствах скрипта' });
+  }
+  if ((e || '') !== secret) {
+    return _json({ ok: false, error: 'forbidden' });
+  }
+  return null;
+}
+
 function _json(obj) {
   return ContentService
     .createTextOutput(JSON.stringify(obj))
@@ -56,9 +73,8 @@ function _fmt(n) {
 
 // ---------- Чтение ----------
 function doGet(e) {
-  if ((e.parameter.secret || '') !== _secret()) {
-    return _json({ ok: false, error: 'forbidden' });
-  }
+  var denied = _denied(e.parameter.secret);
+  if (denied) return denied;
   var raw = _sheet(DATA_SHEET, true).getRange('A1').getValue();
   var ledger = null;
   if (raw) {
@@ -75,9 +91,8 @@ function doPost(e) {
   } catch (err) {
     return _json({ ok: false, error: 'bad json' });
   }
-  if ((body.secret || '') !== _secret()) {
-    return _json({ ok: false, error: 'forbidden' });
-  }
+  var denied = _denied(body.secret);
+  if (denied) return denied;
   if (!body.ledger) {
     return _json({ ok: false, error: 'no ledger' });
   }
