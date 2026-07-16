@@ -23,6 +23,7 @@
 var DATA_SHEET = '_data';
 var LEDGER_SHEET = 'Реестр';
 var EXPENSES_SHEET = 'Расходы';
+var JOURNAL_SHEET = 'Журнал';
 
 function _secret() {
   return PropertiesService.getScriptProperties().getProperty('SHEET_SECRET') || '';
@@ -104,6 +105,9 @@ function doPost(e) {
     _sheet(DATA_SHEET, true).getRange('A1').setValue(JSON.stringify(body.ledger));
     renderLedger(body.ledger);
     renderExpenses(body.ledger);
+    // Журнал ДОписываем и никогда не перерисовываем: «Реестр» и «Расходы» — это
+    // вид на текущее состояние, а журнал — история, её нельзя пересобрать заново.
+    appendJournal(body.log);
     return _json({ ok: true });
   } finally {
     lock.releaseLock();
@@ -150,6 +154,36 @@ function renderLedger(ledger) {
   sh.setColumnWidth(1, 260);
   sh.setColumnWidth(2, 140);
   sh.setColumnWidth(3, 380);
+}
+
+// ---------- Журнал: только дописываем ----------
+var JOURNAL_HEADERS = ['Дата', 'Время', 'Тип', 'Позиция', 'Было', 'Стало',
+                       'Изменение', 'Наши активы после', 'Что сказано'];
+
+function appendJournal(entries) {
+  if (!entries || !entries.length) return;
+  var sh = _sheet(JOURNAL_SHEET, false);
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(JOURNAL_HEADERS);
+    sh.getRange(1, 1, 1, JOURNAL_HEADERS.length).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(4, 220);
+    sh.setColumnWidth(9, 420);
+  }
+  var rows = entries.map(function (e) {
+    var at = String(e.at || '');            // "2026-07-16 14:32" по Москве
+    var parts = at.split(' ');
+    return [
+      parts[0] || '', parts[1] || '',
+      e.kind === 'correction' ? 'правка данных' : 'операция',
+      String(e.label || e.path || ''),
+      _num(e.before), _num(e.after), _num(e.amount), _num(e.our_assets),
+      String(e.summary || ''),
+    ];
+  });
+  var start = sh.getLastRow() + 1;
+  sh.getRange(start, 1, rows.length, JOURNAL_HEADERS.length).setValues(rows);
+  sh.getRange(start, 5, rows.length, 4).setNumberFormat('#,##0 $');
 }
 
 function renderExpenses(ledger) {

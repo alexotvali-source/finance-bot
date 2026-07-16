@@ -13,7 +13,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+
+log = logging.getLogger(__name__)
 
 # Валюта одна — доллары. Рублёвые расходы осознанно вне реестра.
 CURRENCY = "$"
@@ -192,6 +195,33 @@ def net_external(changes: list) -> float:
     исчезли 1 258 196 у Макса.
     """
     return sum(_num(c.get("amount")) for c in changes)
+
+
+def log_entries(before: dict, after: dict, changes: list, summary: str,
+                correction: bool, at: str) -> list:
+    """Строки журнала: что именно изменилось, когда и почему.
+
+    Живут строками на отдельном листе, а НЕ внутри JSON реестра: канонический JSON
+    лежит в одной ячейке _data!A1 с лимитом 50 000 символов, и растущий журнал рано
+    или поздно упёрся бы в него — то есть уронил бы запись самого реестра.
+    """
+    ours = compute(after)["our_assets"]
+    return [
+        {
+            "at": at,
+            "kind": "correction" if correction else "operation",
+            "path": c["path"],
+            "label": label(c["path"]),
+            "before": get(before, c["path"]),
+            "after": get(after, c["path"]),
+            "amount": _num(c.get("amount")),
+            # Наши активы на момент операции — чтобы журнал читался сам по себе,
+            # без пересчёта всей истории.
+            "our_assets": ours,
+            "summary": summary,
+        }
+        for c in changes
+    ]
 
 
 def format_preview(before: dict, changes: list, summary: str, today: str,
@@ -470,14 +500,31 @@ def read(notes_dir: str, user_id: str) -> dict:
     return book
 
 
-def write(notes_dir: str, user_id: str, book: dict) -> None:
-    """Пишет реестр в единственный источник правды."""
+def write(notes_dir: str, user_id: str, book: dict, entries: list | None = None) -> None:
+    """Пишет реестр в единственный источник правды. entries — строки журнала."""
     import sheet
 
     if not sheet.enabled():
         save(notes_dir, user_id, book)
+        _append_local_log(notes_dir, user_id, entries)
         return
-    sheet.save(book, backup_path=_path(notes_dir, user_id))
+    sheet.save(book, entries=entries, backup_path=_path(notes_dir, user_id))
+
+
+def _append_local_log(notes_dir: str, user_id: str, entries: list | None) -> None:
+    """Журнал без таблицы — в JSONL рядом с реестром. Дописываем, не переписываем:
+    журнал только растёт, иначе он не журнал."""
+    if not entries:
+        return
+    p = os.path.join(os.path.dirname(_path(notes_dir, user_id)), "ledger_log.jsonl")
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    except Exception:
+        # Реестр уже сохранён — терять его из-за журнала нельзя.
+        log.exception("не смог дописать локальный журнал")
 
 
 def load_or_seed(notes_dir: str, user_id: str) -> dict:

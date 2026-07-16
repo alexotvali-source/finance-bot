@@ -46,13 +46,17 @@ def load() -> dict | None:
     return res.get("ledger")
 
 
-def save(ledger: dict, backup_path: str | None = None) -> None:
+def save(ledger: dict, entries: list | None = None, backup_path: str | None = None) -> None:
     """Пишет реестр в таблицу. Локальная копия — только после успеха таблицы,
-    чтобы резерв никогда не оказался новее правды."""
+    чтобы резерв никогда не оказался новее правды.
+
+    entries — строки журнала этой операции. Таблица их ДОПИСЫВАЕТ на отдельный лист;
+    сюда шлём только новые, всю историю гонять незачем."""
+    body = {"secret": SECRET, "ledger": ledger}
+    if entries:
+        body["log"] = entries
     try:
-        r = requests.post(
-            WEBHOOK_URL, json={"secret": SECRET, "ledger": ledger}, timeout=30
-        )
+        r = requests.post(WEBHOOK_URL, json=body, timeout=30)
         r.raise_for_status()
         res = r.json()
     except Exception as e:

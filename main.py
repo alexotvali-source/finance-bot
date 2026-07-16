@@ -763,10 +763,11 @@ async def _read_ledger(update: Update, user_id: str):
         return None
 
 
-async def _write_ledger(update: Update, user_id: str, book: dict) -> bool:
+async def _write_ledger(update: Update, user_id: str, book: dict,
+                        entries: list | None = None) -> bool:
     """Пишет реестр. Не смог — говорит прямо: изменение НЕ применено."""
     try:
-        ledger.write(NOTES_DIR, user_id, book)
+        ledger.write(NOTES_DIR, user_id, book, entries)
         return True
     except Exception as e:
         log.exception("ledger write error")
@@ -998,13 +999,20 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Ждём подтверждения операции над реестром?
     pending_ledger = context.user_data.pop("pending_ledger", None)
+    meta = context.user_data.pop("pending_ledger_meta", None) or {}
     if pending_ledger:
         if _is_yes(transcript):
-            book = await _read_ledger(update, user_id)
-            if book is None:
+            before = await _read_ledger(update, user_id)
+            if before is None:
                 return
-            book = ledger.apply(book, pending_ledger, _today())
-            if not await _write_ledger(update, user_id, book):
+            book = ledger.apply(before, pending_ledger, _today())
+            entries = ledger.log_entries(
+                before, book, pending_ledger,
+                meta.get("summary") or "Изменение реестра",
+                bool(meta.get("correction")),
+                _now().strftime("%Y-%m-%d %H:%M"),
+            )
+            if not await _write_ledger(update, user_id, book, entries):
                 return
             await update.message.reply_text(
                 "✅ Применил.\n\n" + ledger.format_balance(book, _fmt_date),
@@ -1144,10 +1152,16 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not changes:
                 await update.message.reply_text("В реестре ничего не меняется — суммы те же.")
                 return
+            summary = money.get("summary") or "Изменение реестра"
             context.user_data["pending_ledger"] = changes
+            # Что и почему — нужно журналу в момент подтверждения, а не сейчас.
+            context.user_data["pending_ledger_meta"] = {
+                "summary": summary,
+                "correction": bool(money.get("correction")),
+            }
             await update.message.reply_text(
-                ledger.format_preview(book, changes, money.get("summary") or "Изменение реестра",
-                                      _today(), correction=bool(money.get("correction"))),
+                ledger.format_preview(book, changes, summary, _today(),
+                                      correction=bool(money.get("correction"))),
                 parse_mode="HTML",
             )
             return
