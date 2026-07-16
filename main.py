@@ -298,6 +298,16 @@ def restructure_with_correction(transcript: str, structured: str, instruction: s
     return _claude(STRUCTURE_PROMPT, user)
 
 
+def mentions_ledger(text: str) -> bool:
+    """Фраза про деньги, а не про заметки. Такие сообщения роутер заметок видеть
+    не должен: «удали последний расход» он понимал как удаление записи дневника
+    и удалял её. И в денежную ветку такие фразы идут даже без цифр —
+    в «удали последний расход» цифр нет вовсе."""
+    t = text.lower()
+    return any(w in t for w in ("расход", "баланс", "реестр", "управлени",
+                                "дебитор", "актив", "кошел", "спиши", "списа"))
+
+
 def looks_like_edit(text: str) -> bool:
     """Дешёвый пред-фильтр: похоже ли сообщение на команду правки записи.
     Если да — стоит спросить у модели-роутера; иначе это точно обычная заметка."""
@@ -1205,9 +1215,20 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Голое «да»/«нет» без ожидающей операции — это не заметка. Раньше такое
+    # записывалось пустой записью («распознано только слово „да“») и замусоривало день.
+    if _is_yes(transcript) or _is_no(transcript):
+        await update.message.reply_text(
+            "Сейчас нечего подтверждать или отменять — операция уже завершена."
+        )
+        return
+
     # Команда правки/удаления записи или обычная заметка?
+    # Фразы про деньги мимо роутера заметок: «удали последний расход» — это
+    # про реестр, а не про запись дневника.
     notes = load_day(user_id, _today())
-    route = route_message(transcript, notes)
+    route = {"action": "note"} if mentions_ledger(transcript) \
+        else route_message(transcript, notes)
     action = route.get("action", "note")
 
     if action == "delete_day":
@@ -1272,7 +1293,8 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Про деньги? Тогда это операция над реестром, а не заметка.
-    if any(ch.isdigit() for ch in transcript):
+    # Цифры ИЛИ денежные слова: «удали последний расход» — без единой цифры.
+    if any(ch.isdigit() for ch in transcript) or mentions_ledger(transcript):
         book = await _read_ledger(update, user_id)
         if book is None:
             return
