@@ -172,9 +172,6 @@ function appendJournal(entries) {
     sh.setFrozenRows(1);
     sh.setColumnWidth(4, 220);
     sh.setColumnWidth(9, 420);
-    // Дату и время держим ТЕКСТОМ: иначе Sheets распознает «2026-07-16» как дату
-    // и вернёт боту Date вместо строки. ISO ещё и сортируется хронологически.
-    sh.getRange(1, 1, sh.getMaxRows(), 2).setNumberFormat('@');
   }
   var rows = entries.map(function (e) {
     var at = String(e.at || '');            // "2026-07-16 14:32" по Москве
@@ -188,6 +185,10 @@ function appendJournal(entries) {
     ];
   });
   var start = sh.getLastRow() + 1;
+  // Дату и время держим ТЕКСТОМ, и формат ставим на КАЖДУЮ дозапись: иначе Sheets
+  // превращает «2026-07-16» в Date и отдаёт боту объект даты вместо строки.
+  // Ставить формат только при создании листа мало — существующий лист он не покроет.
+  sh.getRange(start, 1, rows.length, 2).setNumberFormat('@');
   sh.getRange(start, 1, rows.length, JOURNAL_HEADERS.length).setValues(rows);
   sh.getRange(start, 5, rows.length, 4).setNumberFormat('#,##0 $');
 }
@@ -201,17 +202,29 @@ function readJournal(limit) {
   var vals = sh.getRange(sh.getLastRow() - n + 1, 1, n, JOURNAL_HEADERS.length).getValues();
   return vals.map(function (r) {
     return {
-      date: _text(r[0]), time: _text(r[1]), kind: _text(r[2]), label: _text(r[3]),
+      date: _text(r[0]), time: _timeText(r[1]), kind: _text(r[2]), label: _text(r[3]),
       before: _num(r[4]), after: _num(r[5]), amount: _num(r[6]),
       our_assets: _num(r[7]), summary: _text(r[8]),
     };
   });
 }
 
-/** Ячейку могли когда-то отформатировать датой — тогда тут Date, а не строка. */
+/** Часовой пояс таблицы: в нём Sheets распарсил старые даты, в нём и форматируем. */
+function _tz() {
+  return SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+}
+
+/** Ранние строки журнала Sheets успел превратить в Date — терпим оба вида. */
 function _text(v) {
   if (v instanceof Date) {
-    return Utilities.formatDate(v, 'Europe/Moscow', 'yyyy-MM-dd');
+    return Utilities.formatDate(v, _tz(), 'yyyy-MM-dd');
+  }
+  return String(v == null ? '' : v);
+}
+
+function _timeText(v) {
+  if (v instanceof Date) {
+    return Utilities.formatDate(v, _tz(), 'HH:mm');
   }
   return String(v == null ? '' : v);
 }
