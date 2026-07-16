@@ -1097,7 +1097,7 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Возврат меняет рабочий баланс — обязан лечь в журнал.
                 entries = ledger.log_entries(
                     before, book, [{"path": "wallet.working", "amount": refund}],
-                    f"Отмена расхода: {ledger.describe_expense(rec)}", False,
+                    f"Отмена расхода: {ledger.describe_expense(rec, with_date=False)}", False,
                     _now().strftime("%Y-%m-%d %H:%M"),
                 )
             if not await _write_ledger(update, user_id, book, entries):

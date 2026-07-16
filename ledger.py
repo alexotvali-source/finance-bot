@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 
 log = logging.getLogger(__name__)
 
@@ -264,23 +265,23 @@ def _journal_when(r: dict, fmt_date) -> str:
 
 
 def format_journal(rows: list, fmt_date=lambda s: s) -> str:
-    """Журнал для телефона: что изменилось и когда, старое сверху — как в листе."""
+    """Журнал для телефона: хронологически, старое сверху, две строки на запись."""
     if not rows:
         return ("📔 <b>Журнал пуст</b>\n\nЗдесь будет каждое изменение реестра. "
                 "Записи появятся начиная с первой операции.")
     lines = [f"📔 <b>Журнал — последние {len(rows)}</b>\n"]
-    for r in rows:  # хронологически, сверху вниз — Илья так попросил
+    for r in rows:
         d = _journal_when(r, fmt_date)
         mark = "🛠" if r["kind"].startswith("правка") else "•"
         amount = _num(r["amount"])
         sign = "+" if amount > 0 else "−"
-        lines.append(
-            f"{mark} <b>{d}</b> — {r['label']}\n"
-            f"   {fmt(r['before'])} → <b>{fmt(r['after'])}</b> "
-            f"({sign}{fmt(abs(amount))} {CURRENCY})"
-        )
-        if r.get("summary"):
-            lines.append(f"   <i>{r['summary']}</i>")
+        # В ранние описания дата вклеена текстом «(2026-07-16)» — здесь она мусор,
+        # рядом есть нормальная. Историю в листе не трогаем, чистим только показ.
+        summary = re.sub(r"\s*\(\d{4}-\d{2}-\d{2}\)", "", r.get("summary") or "").strip()
+        head = f"{mark} <b>{d}</b>" + (f" · {summary}" if summary else "")
+        lines.append(head)
+        lines.append(f"   {r['label']}: {sign}{fmt(abs(amount))} → "
+                     f"<b>{fmt(r['after'])}</b> {CURRENCY}")
     return "\n".join(lines)
 
 
@@ -525,13 +526,19 @@ def remove_last_expense(ledger: dict, today: str):
     return new, rec, refund
 
 
-def describe_expense(rec: dict) -> str:
-    """«купил Старкнет — Илья: 10 000 $ (16-07-26)» — чтобы было ясно, ЧТО удаляем."""
+def describe_expense(rec: dict, with_date: bool = True) -> str:
+    """«купил Старкнет — Илья: 10 000 $ (16-07-26)» — чтобы было ясно, ЧТО удаляем.
+
+    with_date=False — для журнала: там дата стоит отдельной колонкой,
+    и вклеенная в текст она просто мусор."""
     who = ", ".join(f"{n}: {_money(v.get('rub'), v.get('usd'))}"
                     for n, v in (rec.get("by_person") or {}).items())
     total = _money(rec.get("total_rub"), rec.get("total_usd"))
     bits = [b for b in (rec.get("note"), who or f"итого {total}") if b]
-    return " — ".join(bits) + (f" ({rec.get('date')})" if rec.get("date") else "")
+    out = " — ".join(bits)
+    if with_date and rec.get("date"):
+        out += f" ({rec['date']})"
+    return out
 
 
 def expense_totals(ledger: dict) -> dict:
