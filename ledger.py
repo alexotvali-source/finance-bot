@@ -507,6 +507,16 @@ def expense_totals(ledger: dict) -> dict:
     }
 
 
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    """1 запись / 2 записи / 5 записей."""
+    n = abs(n)
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
 def _money(rub, usd) -> str:
     """«2 951 930 ₽ + 401 847 $». Валюты не складываем: курс у каждой записи свой."""
     bits = []
@@ -518,48 +528,24 @@ def _money(rub, usd) -> str:
 
 
 def format_expenses(ledger: dict, fmt_date=lambda s: s) -> str:
+    """Сводка для кнопки: сколько всего и по кому. Полная расшифровка по каждой
+    записи — в таблице, лист «Расходы»; дублировать её в бот незачем."""
     recs = ledger.get("expenses") or []
     if not recs:
         return ("🧾 <b>Расходов пока нет</b>\n\n"
                 "Скажи «потратил 300 000 на офис» — запишу сюда.")
-    lines = ["🧾 <b>Расходы</b>"]
-    for rec in recs:
-        when = fmt_date(rec.get("date") or "")
-        period = rec.get("period")
-        # Период пишем через точку, а не «за {period}»: получалось «за до 15.03».
-        lines.append(f"\n<b>{when}</b>" + (f" · {period}" if period else ""))
-        if rec.get("note"):
-            lines.append(f"<i>{rec['note']}</i>")
-        for name, v in (rec.get("by_person") or {}).items():
-            lines.append(f"• {name}: {_money(v.get('rub'), v.get('usd'))}")
-        lines.append(f"<b>Итого: {_money(rec.get('total_rub'), rec.get('total_usd'))}</b>")
-        if _num(rec.get("covered_by_profit_rub")):
-            lines.append(f"↳ покрыто прибылью: {fmt(rec['covered_by_profit_rub'])} ₽")
-        p = rec.get("paid_from_working") or {}
-        if _num(p.get("usd")):
-            rate = expense_rate(rec)
-            rate_s = f" (курс {rate:.2f})" if rate else ""
-            lines.append(f"↳ с рабочего баланса: {fmt(p.get('rub'))} ₽ = "
-                         f"<b>{fmt(p['usd'])} $</b>{rate_s}")
-        # Старые записи метки не имеют — про них честнее промолчать, чем гадать.
-        if "deducted" in rec:
-            lines.append("↳ 💳 списан с баланса" if rec["deducted"]
-                         else "↳ 📌 только запись, баланс не тронут")
-
     t = expense_totals(ledger)
-    lines.append("\n━━━━━━━━━━━━━━")
-    lines.append("<b>Накопительно</b>")
+    lines = [f"🧾 <b>Всего потрачено: {_money(t['total_rub'], t['total_usd'])}</b>\n"]
     for name in t["rub_by_person"]:
         lines.append(f"• {name}: "
                      f"{_money(t['rub_by_person'].get(name), t['usd_by_person'].get(name))}")
-    lines.append(f"\nВсего потрачено: <b>{_money(t['total_rub'], t['total_usd'])}</b>")
-    if t["covered_rub"]:
-        lines.append(f"Покрыто прибылью: {fmt(t['covered_rub'])} ₽")
     # Главная строка: из всех этих миллионов реестр видел только эти доллары.
     # Рубли тут — описание трат, они по балансу не бьют.
     if t["paid_usd"]:
-        lines.append(f"<b>С рабочего баланса ушло: {fmt(t['paid_usd'])} $</b>")
+        lines.append(f"\n<b>С рабочего баланса ушло: {fmt(t['paid_usd'])} $</b>")
         lines.append("<i>только эта сумма трогала реестр</i>")
+    word = _plural(len(recs), "запись", "записи", "записей")
+    lines.append(f"\n<i>Всё по датам — в таблице, лист «Расходы» ({len(recs)} {word}).</i>")
     return "\n".join(lines)
 
 
