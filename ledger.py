@@ -120,6 +120,11 @@ def label(path: str) -> str:
     return parts[1]
 
 
+# Виртуальный путь: не позиция, а весь кошелёк целиком (рабочий + в управлении).
+# Илья называет именно эту цифру — «операционный баланс».
+OPERATIONAL = "wallet.operational"
+
+
 def to_changes(ledger: dict, ops: dict) -> list:
     """Превращает названные Ильёй остатки ("set") и изменения ("add") в дельты.
 
@@ -127,11 +132,37 @@ def to_changes(ledger: dict, ops: dict) -> list:
     услышала. Именно на арифметике и классификации она уже ошибалась.
     """
     changes = []
+    operational = None
     for item in ops.get("set") or []:
         path = item["path"]
-        changes.append({"path": path, "amount": _num(item.get("amount")) - get(ledger, path)})
+        amount = _num(item.get("amount"))
+        if path == OPERATIONAL:
+            # Считаем последним: см. ниже.
+            operational = amount
+            continue
+        changes.append({"path": path, "amount": amount - get(ledger, path)})
     for item in ops.get("add") or []:
-        changes.append({"path": item["path"], "amount": _num(item.get("amount"))})
+        path = item["path"]
+        if path == OPERATIONAL:
+            # «Операционный вырос на 100 000» — чьи это деньги, наши или чужие?
+            # Не угадываем: разница между прибылью и чужим взносом здесь и живёт.
+            raise ValueError(
+                "сказано про изменение операционного баланса, но не сказано, чьи это деньги. "
+                "Назови новый остаток целиком или укажи позицию (рабочий баланс / имя)"
+            )
+        changes.append({"path": path, "amount": _num(item.get("amount"))})
+
+    if operational is not None:
+        # Наш только остаток после вычета чужого:
+        #   рабочий = операционный − в управлении
+        # Иначе чужие деньги (у Макса и НИКО их 1,4 млн) станут «прибылью» Ильи.
+        # Считаем ПОСЛЕ остальных изменений: если в том же сообщении назван и новый
+        # баланс Макса, операционный назван уже с его учётом — иначе задвоим.
+        after = apply(ledger, changes, ledger.get("updated_at") or "")
+        changes.append(
+            {"path": "wallet.working", "amount": operational - compute(after)["wallet_total"]}
+        )
+
     # Пустые изменения выкидываем: «Стефан 325 168», когда там уже 325 168, — не событие.
     return [c for c in changes if round(c["amount"]) != 0]
 
