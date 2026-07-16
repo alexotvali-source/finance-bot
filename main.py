@@ -61,6 +61,16 @@ ALLOWED_USER_IDS = {
     if uid.strip()
 }
 
+# Только чтение: видит реестр/расходы/журнал, менять ничего не может.
+# По умолчанию — Дмитрий (партнёр, «у нас всё общее»); Илья дал его id 16.07.2026
+# и попросил доступ без возможности редактирования. Переменная окружения может
+# расширить или закрыть список (READONLY_USER_ID="" отключит).
+READONLY_USER_IDS = {
+    uid.strip()
+    for uid in os.environ.get("READONLY_USER_ID", "8315850045").replace(";", ",").split(",")
+    if uid.strip()
+}
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("voice-notes-bot")
 anthropic = Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -650,13 +660,22 @@ def allowed(update: Update) -> bool:
     return bool(user) and str(user.id) in ALLOWED_USER_IDS
 
 
+def can_view(update: Update) -> bool:
+    """Смотреть (реестр/расходы/журнал) могут владелец и read-only список.
+    Менять — только владелец: у read-only любое сообщение вежливо отбивается."""
+    user = update.effective_user
+    return allowed(update) or (bool(user) and str(user.id) in READONLY_USER_IDS)
+
+
 # ---------- Хендлеры ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Не-владельцу (привет, Дмитрий) справку не показываем: она раскрывает механику
     # реестра, а пользоваться ботом всё равно может только Илья (fail-closed).
     if not allowed(update):
         await update.message.reply_text(
-            "ну что, Димасик, это не за камерами подглядывать, но тоже интересно"
+            "ну что, Димасик, это не за камерами подглядывать, но тоже интересно",
+            # Read-only видит те же кнопки: команды сами решают, кого пускать.
+            reply_markup=MAIN_KEYBOARD if can_view(update) else None,
         )
         return
     # Справки нет — Илья попросил убрать. /start только выдаёт клавиатуру.
@@ -801,7 +820,7 @@ async def _write_ledger(update: Update, user_id: str, book: dict,
 
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Реестр: кто чем владеет и сколько где лежит. Итоги считает Python, не модель."""
-    if not allowed(update):
+    if not can_view(update):
         await update.message.reply_text("Доступ только для владельца бота.")
         return
     book = await _read_ledger(update, str(update.effective_user.id))
@@ -816,7 +835,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def journal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Журнал: что менялось в реестре, когда и почему."""
-    if not allowed(update):
+    if not can_view(update):
         await update.message.reply_text("Доступ только для владельца бота.")
         return
     try:
@@ -835,7 +854,7 @@ async def journal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def expenses_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Журнал расходов: когда и сколько потрачено. Рубли — описание, доллары бьют по балансу."""
-    if not allowed(update):
+    if not can_view(update):
         await update.message.reply_text("Доступ только для владельца бота.")
         return
     book = await _read_ledger(update, str(update.effective_user.id))
@@ -993,6 +1012,13 @@ async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
+        if can_view(update):
+            # Read-only (Дмитрий): смотреть можно, менять нельзя — ни реестр, ни заметки.
+            await update.message.reply_text(
+                "Тебе можно смотреть: 📊 Реестр, 🧾 Расходы, 📔 Журнал — кнопки внизу.\n"
+                "Менять реестр может только Илья."
+            )
+            return
         log.warning("Отказ в доступе: user_id=%s", update.effective_user.id)
         await update.message.reply_text("Доступ только для владельца бота.")
         return
