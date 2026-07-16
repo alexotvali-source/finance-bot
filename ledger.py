@@ -485,57 +485,59 @@ def expense_totals(ledger: dict) -> dict:
     }
 
 
+def _money(rub, usd) -> str:
+    """«2 951 930 ₽ + 401 847 $». Валюты не складываем: курс у каждой записи свой."""
+    bits = []
+    if _num(rub):
+        bits.append(f"{fmt(rub)} ₽")
+    if _num(usd):
+        bits.append(f"{fmt(usd)} $")
+    return " + ".join(bits) or "0"
+
+
 def format_expenses(ledger: dict, fmt_date=lambda s: s) -> str:
     recs = ledger.get("expenses") or []
     if not recs:
-        return "Расходов в журнале пока нет."
+        return ("🧾 <b>Расходов пока нет</b>\n\n"
+                "Скажи «потратил 300 000 на офис» — запишу сюда.")
     lines = ["🧾 <b>Расходы</b>"]
     for rec in recs:
         when = fmt_date(rec.get("date") or "")
         period = rec.get("period")
-        head = f"\n<b>{when}</b>" + (f" — за {period}" if period else "")
-        lines.append(head)
+        # Период пишем через точку, а не «за {period}»: получалось «за до 15.03».
+        lines.append(f"\n<b>{when}</b>" + (f" · {period}" if period else ""))
         if rec.get("note"):
             lines.append(f"<i>{rec['note']}</i>")
         for name, v in (rec.get("by_person") or {}).items():
-            bits = []
-            if _num(v.get("rub")):
-                bits.append(f"{fmt(v['rub'])} ₽")
-            if _num(v.get("usd")):
-                bits.append(f"{fmt(v['usd'])} $")
-            lines.append(f"• {name}: {' + '.join(bits)}")
-        totals = []
-        if _num(rec.get("total_rub")):
-            totals.append(f"{fmt(rec['total_rub'])} ₽")
-        if _num(rec.get("total_usd")):
-            totals.append(f"{fmt(rec['total_usd'])} $")
-        if totals:
-            lines.append(f"Итого: <b>{' + '.join(totals)}</b>")
+            lines.append(f"• {name}: {_money(v.get('rub'), v.get('usd'))}")
+        lines.append(f"<b>Итого: {_money(rec.get('total_rub'), rec.get('total_usd'))}</b>")
         if _num(rec.get("covered_by_profit_rub")):
-            lines.append(f"Покрыто прибылью: {fmt(rec['covered_by_profit_rub'])} ₽")
+            lines.append(f"↳ покрыто прибылью: {fmt(rec['covered_by_profit_rub'])} ₽")
         p = rec.get("paid_from_working") or {}
         if _num(p.get("usd")):
             rate = expense_rate(rec)
-            rate_s = f" по {rate:.2f} ₽/$" if rate else ""
-            lines.append(
-                f"С рабочих средств: {fmt(p.get('rub'))} ₽ = <b>{fmt(p['usd'])} $</b>{rate_s}"
-            )
+            rate_s = f" (курс {rate:.2f})" if rate else ""
+            lines.append(f"↳ с рабочего баланса: {fmt(p.get('rub'))} ₽ = "
+                         f"<b>{fmt(p['usd'])} $</b>{rate_s}")
+        # Старые записи метки не имеют — про них честнее промолчать, чем гадать.
+        if "deducted" in rec:
+            lines.append("↳ 💳 списан с баланса" if rec["deducted"]
+                         else "↳ 📌 только запись, баланс не тронут")
 
     t = expense_totals(ledger)
-    lines.append("\n<b>Накопительно</b>")
+    lines.append("\n━━━━━━━━━━━━━━")
+    lines.append("<b>Накопительно</b>")
     for name in t["rub_by_person"]:
-        bits = []
-        if t["rub_by_person"].get(name):
-            bits.append(f"{fmt(t['rub_by_person'][name])} ₽")
-        if t["usd_by_person"].get(name):
-            bits.append(f"{fmt(t['usd_by_person'][name])} $")
-        lines.append(f"• {name}: {' + '.join(bits)}")
-    spent = []
-    if t["total_rub"]:
-        spent.append(f"{fmt(t['total_rub'])} ₽")
-    if t["total_usd"]:
-        spent.append(f"{fmt(t['total_usd'])} $")
-    lines.append(f"Всего потрачено: <b>{' + '.join(spent)}</b>")
+        lines.append(f"• {name}: "
+                     f"{_money(t['rub_by_person'].get(name), t['usd_by_person'].get(name))}")
+    lines.append(f"\nВсего потрачено: <b>{_money(t['total_rub'], t['total_usd'])}</b>")
+    if t["covered_rub"]:
+        lines.append(f"Покрыто прибылью: {fmt(t['covered_rub'])} ₽")
+    # Главная строка: из всех этих миллионов реестр видел только эти доллары.
+    # Рубли тут — описание трат, они по балансу не бьют.
+    if t["paid_usd"]:
+        lines.append(f"<b>С рабочего баланса ушло: {fmt(t['paid_usd'])} $</b>")
+        lines.append("<i>только эта сумма трогала реестр</i>")
     return "\n".join(lines)
 
 
