@@ -20,6 +20,11 @@
  *   4. URL и секрет пропиши в переменные Railway: SHEET_WEBHOOK_URL, SHEET_SECRET.
  */
 
+// Версия кода. Возвращается в ответах (в т.ч. без секрета): по ней снаружи видно,
+// какая версия реально развёрнута. Дважды деплоили старьё, потому что вставка
+// в редактор молча не срабатывала, а по виду шапки версии неотличимы.
+var CODE_VERSION = 6;
+
 var DATA_SHEET = '_data';
 var LEDGER_SHEET = 'Реестр';
 var EXPENSES_SHEET = 'Расходы';
@@ -38,10 +43,10 @@ function _secret() {
 function _denied(e) {
   var secret = _secret();
   if (!secret) {
-    return _json({ ok: false, error: 'SHEET_SECRET не задан в свойствах скрипта' });
+    return _json({ ok: false, error: 'SHEET_SECRET не задан в свойствах скрипта', v: CODE_VERSION });
   }
   if ((e || '') !== secret) {
-    return _json({ ok: false, error: 'forbidden' });
+    return _json({ ok: false, error: 'forbidden', v: CODE_VERSION });
   }
   return null;
 }
@@ -77,7 +82,7 @@ function doGet(e) {
   var denied = _denied(e.parameter.secret);
   if (denied) return denied;
   if (e.parameter.log) {
-    return _json({ ok: true, log: readJournal(_num(e.parameter.log) || 15) });
+    return _json({ ok: true, v: CODE_VERSION, log: readJournal(_num(e.parameter.log) || 15) });
   }
   var raw = _sheet(DATA_SHEET, true).getRange('A1').getValue();
   var ledger = null;
