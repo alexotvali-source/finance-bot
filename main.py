@@ -1076,7 +1076,7 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if deduct:
                 # Списание меняет рабочий баланс — значит обязано быть в журнале.
                 # Иначе цифра уедет, а следа не останется.
-                usd = ledger.paid_usd(rec)
+                usd = ledger.deduct_usd(rec)
                 entries = ledger.log_entries(
                     before, book, [{"path": "wallet.working", "amount": -usd}],
                     f"Расход: {rec.get('note') or 'без описания'}", False,

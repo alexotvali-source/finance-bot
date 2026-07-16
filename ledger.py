@@ -365,7 +365,9 @@ def check_expense(rec: dict) -> list[str]:
     for cur, key, sign in (("rub", "total_rub", "₽"), ("usd", "total_usd", "$")):
         total = _num(rec.get(key))
         parts_sum = sum(_num(v.get(cur)) for v in by_person.values())
-        if (total or parts_sum) and round(parts_sum) != round(total):
+        # Сверяем ТОЛЬКО когда разбивка вообще дана. «Общий расход 15 000» без имён —
+        # это законная запись, а не расхождение: сверять итог не с чем.
+        if parts_sum and round(parts_sum) != round(total):
             problems.append(
                 f"разбивка по людям даёт {fmt(parts_sum)} {sign}, "
                 f"а итого указано {fmt(total)} {sign}"
@@ -388,6 +390,21 @@ def paid_usd(rec: dict) -> float:
     return _num((rec.get("paid_from_working") or {}).get("usd"))
 
 
+def deduct_usd(rec: dict) -> float:
+    """Сколько долларов списать с баланса.
+
+    Приоритет — явно названному paid_from_working.usd (там курс уже посчитан Ильёй).
+    Если его нет, но расход ЦЕЛИКОМ долларовый — списываем его итог: доллары уже
+    названы, курс придумывать не надо. Рублёвый расход без долларов сюда не попадёт.
+    """
+    p = paid_usd(rec)
+    if p:
+        return p
+    if _num(rec.get("total_usd")) and not _num(rec.get("total_rub")):
+        return _num(rec.get("total_usd"))
+    return 0.0
+
+
 def check_deduct(rec: dict, deduct: bool) -> list[str]:
     """Можно ли списать этот расход с рабочего баланса.
 
@@ -397,7 +414,7 @@ def check_deduct(rec: dict, deduct: bool) -> list[str]:
     """
     if not deduct:
         return []
-    if not paid_usd(rec):
+    if not deduct_usd(rec):
         return ["сколько это в долларах? Реестр долларовый, а курс я не придумываю"]
     return []
 
@@ -424,7 +441,7 @@ def format_expense_preview(before: dict, rec: dict, deduct: bool) -> str:
     if totals:
         lines.append(f"\n<b>Итого: {' / '.join(totals)}</b>")
 
-    usd = paid_usd(rec)
+    usd = deduct_usd(rec)
     if deduct and usd:
         w = get(before, "wallet.working")
         lines.append(f"\n➡️ <b>Списываю с рабочего баланса {fmt(usd)} {CURRENCY}</b>")
@@ -454,10 +471,15 @@ def add_expense(ledger: dict, rec: dict, deduct: bool, today: str) -> dict:
     new = json.loads(json.dumps(ledger))
     rec = json.loads(json.dumps(rec))
     rec["deducted"] = bool(deduct)
+    usd = deduct_usd(rec)
+    if deduct and usd:
+        # Фиксируем списанную сумму в самой записи, даже если Илья назвал только
+        # долларовый итог: иначе в «Расходах» не будет видно, что и сколько списано.
+        rec.setdefault("paid_from_working", {})["usd"] = usd
     new.setdefault("expenses", []).append(rec)
     new["expenses"].sort(key=lambda r: r.get("date") or "")
     if deduct:
-        _set(new, "wallet.working", get(new, "wallet.working") - paid_usd(rec))
+        _set(new, "wallet.working", get(new, "wallet.working") - usd)
     new["updated_at"] = today
     return new
 
