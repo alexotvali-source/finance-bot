@@ -592,10 +592,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-ALL_BUTTONS = {
-    BTN_LEDGER, BTN_EXPENSES, BTN_JOURNAL, BTN_DAY, BTN_WEEK, BTN_LIST,
-    BTN_HISTORY, BTN_FIND, BTN_UNDO, BTN_CLEAR, BTN_HELP,
-}
+ALL_BUTTONS = {BTN_LEDGER, BTN_EXPENSES, BTN_JOURNAL}
 
 
 # ---------- Inline-клавиатуры (выбор дня и правка записей) ----------
@@ -662,21 +659,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ну что, Димасик, это не за камерами подглядывать, но тоже интересно"
         )
         return
+    # Справки нет — Илья попросил убрать. /start только выдаёт клавиатуру.
     await update.message.reply_text(
-        "💰 <b>Деньги — просто говори цифры</b>\n"
-        "«операционный баланс 2 213 258» — весь кошелёк; рабочий баланс посчитаю сам, "
-        "вычтя деньги в управлении\n"
-        "«баланс Макса 973 406» — деньги в управлении, имя можно новое\n"
-        "«потратил 300 000 на офис» — запишу в расходы, баланс НЕ трону\n"
-        "«...спиши с рабочего баланса» — тогда трону, но спрошу сумму в долларах\n"
-        "«это правка данных, я неверно продиктовал» — не назову это прибылью/расходом\n"
-        "Всегда показываю превью и жду «да».\n\n"
-        "📊 <b>Смотреть — кнопки внизу</b>\n"
-        "/balance — реестр: где что лежит и сколько всего наше\n"
-        "/expenses — расходы: что потрачено и списано ли с баланса\n"
-        "/journal — журнал: что менялось в реестре, когда и почему\n\n"
-        "Всё, что не про деньги, сохраню заметкой. Даты — ДД-ММ-ГГ, время московское.",
-        parse_mode="HTML",
+        "📊 Реестр | 🧾 Расходы | 📔 Журнал — кнопки внизу. Остальное говори голосом.",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -767,22 +752,6 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await expenses_cmd(update, context)
     if text == BTN_JOURNAL:
         return await journal_cmd(update, context)
-    if text == BTN_DAY:
-        return await day_picker(update, context)
-    if text == BTN_WEEK:
-        return await week_cmd(update, context)
-    if text == BTN_LIST:
-        return await list_cmd(update, context)
-    if text == BTN_HISTORY:
-        return await history_cmd(update, context)
-    if text == BTN_FIND:
-        return await find_cmd(update, context)
-    if text == BTN_UNDO:
-        return await undo_cmd(update, context)
-    if text == BTN_CLEAR:
-        return await clear_cmd(update, context)
-    if text == BTN_HELP:
-        return await start(update, context)
 
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1397,19 +1366,14 @@ def main():
             "Узнай свой id через /start и добавь его в переменные окружения."
         )
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
+    # Команды — только деньги, по просьбе Ильи. /start остаётся не как справка,
+    # а как инфраструктура: Telegram шлёт его сам при первом открытии чата, без
+    # обработчика он молча падал бы в никуда; заодно он выдаёт клавиатуру
+    # и «Димасика» не-владельцу.
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("expenses", expenses_cmd))
-    app.add_handler(CommandHandler("list", list_cmd))
-    app.add_handler(CommandHandler("undo", undo_cmd))
-    app.add_handler(CommandHandler("day", day_cmd))
-    app.add_handler(CommandHandler("week", week_cmd))
     app.add_handler(CommandHandler("journal", journal_cmd))
-    app.add_handler(CommandHandler("history", history_cmd))
-    app.add_handler(CommandHandler("find", find_cmd))
-    app.add_handler(CommandHandler("clear", clear_cmd))
-    # Inline-кнопки: выбор дня, просмотр/правка/удаление записи.
-    app.add_handler(CallbackQueryHandler(on_callback))
     # Нажатия кнопок клавиатуры — до общего обработчика заметок.
     app.add_handler(MessageHandler(filters.Text(ALL_BUTTONS), buttons))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_note))
