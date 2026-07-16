@@ -224,7 +224,7 @@ def log_entries(before: dict, after: dict, changes: list, summary: str,
     ]
 
 
-def read_journal(notes_dir: str, user_id: str, limit: int = 15) -> list:
+def read_journal(notes_dir: str, user_id: str, limit: int = 10) -> list:
     """Последние строки журнала из того же источника, где он лежит."""
     import sheet
 
