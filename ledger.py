@@ -250,14 +250,27 @@ def read_journal(notes_dir: str, user_id: str, limit: int = 10) -> list:
     return out
 
 
+def _journal_when(r: dict, fmt_date) -> str:
+    """«16-07-26 15:19» из чего угодно, что лежит в ячейках даты и времени.
+
+    Ранние строки журнала Sheets хранил датами, и наружу они могли выйти
+    как «2026-07-16T00:00:00.000Z» — парсер такого не ждал и молча
+    показывал ISO как есть. Нормализуем вход, а не надеемся на чистоту."""
+    date = str(r.get("date") or "").strip()[:10]
+    time = str(r.get("time") or "").strip()
+    if "T" in time and len(time) >= 16:  # «1899-12-30T15:19:00.000Z» -> «15:19»
+        time = time[11:16]
+    return f"{fmt_date(date)} {time}".strip()
+
+
 def format_journal(rows: list, fmt_date=lambda s: s) -> str:
-    """Журнал для телефона: что изменилось и когда, свежее сверху."""
+    """Журнал для телефона: что изменилось и когда, старое сверху — как в листе."""
     if not rows:
         return ("📔 <b>Журнал пуст</b>\n\nЗдесь будет каждое изменение реестра. "
                 "Записи появятся начиная с первой операции.")
     lines = [f"📔 <b>Журнал — последние {len(rows)}</b>\n"]
-    for r in reversed(rows):  # свежее сверху: смотрят обычно последнее
-        d = f"{fmt_date(r['date'])} {r['time']}".strip()
+    for r in rows:  # хронологически, сверху вниз — Илья так попросил
+        d = _journal_when(r, fmt_date)
         mark = "🛠" if r["kind"].startswith("правка") else "•"
         amount = _num(r["amount"])
         sign = "+" if amount > 0 else "−"
