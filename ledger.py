@@ -576,11 +576,8 @@ def format_expenses(ledger: dict, fmt_date=lambda s: s) -> str:
     for name in t["rub_by_person"]:
         lines.append(f"• {name}: "
                      f"{_money(t['rub_by_person'].get(name), t['usd_by_person'].get(name))}")
-    # Главная строка: из всех этих миллионов реестр видел только эти доллары.
-    # Рубли тут — описание трат, они по балансу не бьют.
-    if t["paid_usd"]:
-        lines.append(f"\n<b>С рабочего баланса ушло: {fmt(t['paid_usd'])} $</b>")
-        lines.append("<i>только эта сумма трогала реестр</i>")
+    # «С рабочего баланса ушло» здесь НЕ показываем — Илья попросил убрать:
+    # эта цифра и так видна в таблице, а кнопка — короткая сводка.
     word = _plural(len(recs), "запись", "записи", "записей")
     lines.append(f"\n<i>Всё по датам — в таблице, лист «Расходы» ({len(recs)} {word}).</i>")
     return "\n".join(lines)
