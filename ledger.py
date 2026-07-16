@@ -426,13 +426,18 @@ def format_expense_preview(before: dict, rec: dict, deduct: bool) -> str:
         lines.append(f"• {rec['note']}")
     if rec.get("period"):
         lines.append(f"• Период: {rec['period']}")
-    for name, v in (rec.get("by_person") or {}).items():
+    by_person = rec.get("by_person") or {}
+    for name, v in by_person.items():
         parts = []
         if _num(v.get("rub")):
             parts.append(f"{fmt(v['rub'])} ₽")
         if _num(v.get("usd")):
             parts.append(f"{fmt(v['usd'])} $")
         lines.append(f"• {name}: {' / '.join(parts)}")
+    if not by_person:
+        # Говорим об этом ДО «да»: безымянный расход не прибавится никому
+        # в накопительных итогах — молча записать такое нельзя.
+        lines.append("• Кто: <b>не указано</b> — в итоги по людям не попадёт")
     totals = []
     if _num(rec.get("total_rub")):
         totals.append(f"{fmt(rec['total_rub'])} ₽")
@@ -471,6 +476,9 @@ def add_expense(ledger: dict, rec: dict, deduct: bool, today: str) -> dict:
     new = json.loads(json.dumps(ledger))
     rec = json.loads(json.dumps(rec))
     rec["deducted"] = bool(deduct)
+    # Момент добавления — для «удали последний расход»: записи сортируются по дате
+    # траты, и без этой метки последней считалась бы не та, что добавлена только что.
+    rec["added_at"] = f"{today} #{len(new.get('expenses') or []):03d}"
     usd = deduct_usd(rec)
     if deduct and usd:
         # Фиксируем списанную сумму в самой записи, даже если Илья назвал только
@@ -482,6 +490,35 @@ def add_expense(ledger: dict, rec: dict, deduct: bool, today: str) -> dict:
         _set(new, "wallet.working", get(new, "wallet.working") - usd)
     new["updated_at"] = today
     return new
+
+
+def remove_last_expense(ledger: dict, today: str):
+    """Отменяет последний ДОБАВЛЕННЫЙ расход (не последний по дате траты: отменяют
+    обычно то, что только что записали). Списанное возвращается на рабочий баланс.
+
+    Возвращает (новый реестр, удалённая запись, возвращённые доллары) или None.
+    """
+    new = json.loads(json.dumps(ledger))
+    recs = new.get("expenses") or []
+    if not recs:
+        return None
+    # У старых записей added_at нет — среди них последней считаем нижнюю по списку.
+    i = max(range(len(recs)), key=lambda k: (recs[k].get("added_at") or "", k))
+    rec = recs.pop(i)
+    refund = deduct_usd(rec) if rec.get("deducted") else 0.0
+    if refund:
+        _set(new, "wallet.working", get(new, "wallet.working") + refund)
+    new["updated_at"] = today
+    return new, rec, refund
+
+
+def describe_expense(rec: dict) -> str:
+    """«купил Старкнет — Илья: 10 000 $ (16-07-26)» — чтобы было ясно, ЧТО удаляем."""
+    who = ", ".join(f"{n}: {_money(v.get('rub'), v.get('usd'))}"
+                    for n, v in (rec.get("by_person") or {}).items())
+    total = _money(rec.get("total_rub"), rec.get("total_usd"))
+    bits = [b for b in (rec.get("note"), who or f"итого {total}") if b]
+    return " — ".join(bits) + (f" ({rec.get('date')})" if rec.get("date") else "")
 
 
 def expense_totals(ledger: dict) -> dict:

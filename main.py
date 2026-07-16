@@ -130,10 +130,23 @@ KIND — что это вообще:
 - "balance" — названы ОСТАТКИ или изменения позиций. Заполняй set/add, expense = null.
 - "expense" — Илья ПОТРАТИЛ деньги: «потратил 300 000 на офис», «расходы за июль:
   Илья 2 951 930, Дмитрий 10 527 758». Заполняй expense, set/add оставь пустыми.
+- "delete_expense" — Илья отменяет расход: «удали эту операцию», «удали последний
+  расход», «отмени расход». Больше ничего не заполняй — программа покажет,
+  какой расход удаляет, и переспросит.
+
+ИМЯ В РАСХОДЕ ТЕРЯТЬ НЕЛЬЗЯ. Если в фразе названо имя — оно ОБЯЗАНО попасть
+в by_person, даже когда человек один:
+- «добавь расход Илья 10 000 долларов» → by_person: {"Илья": {"usd": 10000}},
+  total_usd: 10000. НЕ оставляй by_person пустым: накопительные итоги считаются
+  по именам, безымянный расход Илье не прибавится.
+- «общий расход 15 000» без имён → by_person пустой, только total. Это норма.
+- «с пометкой купил старкнет» → note: "купил Старкнет".
 
 DEDUCT — трогать ли рабочий баланс. По умолчанию FALSE: Илья называет балансы
 снимками, и снимок затрёт списание. true — ТОЛЬКО если он прямо сказал списать:
-«спиши с рабочего баланса», «вычти из общих». Сомневаешься — false.
+«спиши с рабочего баланса», «отними с операционного баланса», «вычти из общих».
+(Списание своих трат всегда идёт из рабочего баланса — это наша часть
+операционного кошелька, отдельного пути нет.) Сомневаешься — false.
 Если deduct=true, а сумма только в рублях — задай question про доллары:
 реестр долларовый, курс придумывать нельзя.
 
@@ -1063,6 +1076,38 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Ответ не про подтверждение: отменяем удаление и обрабатываем как обычно.
         await update.message.reply_text(f"Отменил удаление за {_fmt_date(pending)}.")
 
+    # Ждём подтверждения удаления расхода?
+    if context.user_data.pop("pending_delete_expense", None):
+        if _is_yes(transcript):
+            before = await _read_ledger(update, user_id)
+            if before is None:
+                return
+            res = ledger.remove_last_expense(before, _today())
+            if res is None:
+                await update.message.reply_text("Расходов уже нет — удалять нечего.")
+                return
+            book, rec, refund = res
+            entries = []
+            if refund:
+                # Возврат меняет рабочий баланс — обязан лечь в журнал.
+                entries = ledger.log_entries(
+                    before, book, [{"path": "wallet.working", "amount": refund}],
+                    f"Отмена расхода: {ledger.describe_expense(rec)}", False,
+                    _now().strftime("%Y-%m-%d %H:%M"),
+                )
+            if not await _write_ledger(update, user_id, book, entries):
+                return
+            await update.message.reply_text(
+                "✅ Удалил.\n\n" + ledger.format_balance(book, _fmt_date),
+                parse_mode="HTML",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+        if _is_no(transcript):
+            await update.message.reply_text("Отменил — расход остался на месте.")
+            return
+        await update.message.reply_text("Отменил удаление — расход остался на месте.")
+
     # Ждём подтверждения расхода?
     pending_expense = context.user_data.pop("pending_expense", None)
     if pending_expense:
@@ -1245,6 +1290,28 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if money.get("is_money"):
             if money.get("question"):
                 await update.message.reply_text(f"❓ {money['question']}")
+                return
+
+            if money.get("kind") == "delete_expense":
+                book_now = await _read_ledger(update, user_id)
+                if book_now is None:
+                    return
+                res = ledger.remove_last_expense(book_now, _today())
+                if res is None:
+                    await update.message.reply_text("Расходов нет — удалять нечего.")
+                    return
+                _, rec, refund = res
+                msg = f"🗑 Удаляю расход: <b>{ledger.describe_expense(rec)}</b>"
+                if refund:
+                    w = ledger.get(book_now, "wallet.working")
+                    msg += (f"\n↩️ Возвращаю на рабочий баланс <b>{ledger.fmt(refund)} $</b>"
+                            f"\nРабочий баланс: {ledger.fmt(w)} → "
+                            f"<b>{ledger.fmt(w + refund)}</b> $")
+                else:
+                    msg += "\nБаланс не менялся — просто уберу запись."
+                context.user_data["pending_delete_expense"] = True
+                await update.message.reply_text(msg + "\n\nУдаляем? Ответь «да».",
+                                                parse_mode="HTML")
                 return
 
             if money.get("kind") == "expense" and money.get("expense"):
