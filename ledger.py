@@ -194,11 +194,16 @@ def net_external(changes: list) -> float:
     return sum(_num(c.get("amount")) for c in changes)
 
 
-def format_preview(before: dict, changes: list, summary: str, today: str) -> str:
-    """Что именно изменится. Показываем до применения — тут ловятся ошибки."""
+def format_preview(before: dict, changes: list, summary: str, today: str,
+                   correction: bool = False) -> str:
+    """Что именно изменится. Показываем до применения — тут ловятся ошибки.
+
+    correction=True — Илья правит неверно записанную цифру. Движения денег не было,
+    поэтому называть разницу приростом или расходом нельзя: это ложь про деньги.
+    """
     after = apply(before, changes, today)
     tb, ta = compute(before), compute(after)
-    lines = [f"📝 <b>{summary}</b>\n"]
+    lines = [("🛠 <b>Правка данных</b>\n" if correction else "") + f"📝 <b>{summary}</b>\n"]
 
     for c in changes:
         p = c["path"]
@@ -207,7 +212,11 @@ def format_preview(before: dict, changes: list, summary: str, today: str) -> str
     # Внешний поток называем вслух, но НЕ требуем объяснений: рост рабочих средств —
     # это прибыль, её источник Илья ведёт отдельно. Задача превью — показать, а не допросить.
     net = net_external(changes)
-    if net > 0:
+    if correction:
+        if round(net) != 0:
+            lines.append(f"\n🛠 <b>Исправление цифры на {fmt(abs(net))} {CURRENCY}</b> — "
+                         "движения денег не было, это не прибыль и не расход.")
+    elif net > 0:
         lines.append(f"\n⬅️ <b>Прирост: +{fmt(net)} {CURRENCY}</b>")
     elif net < 0:
         lines.append(f"\n➡️ <b>Ушло наружу: {fmt(-net)} {CURRENCY}</b>")
