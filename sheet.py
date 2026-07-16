@@ -46,6 +46,19 @@ def load() -> dict | None:
     return res.get("ledger")
 
 
+def journal(limit: int = 15) -> list:
+    """Последние строки журнала. Живут в таблице, а не в реестре."""
+    try:
+        r = requests.get(WEBHOOK_URL, params={"secret": SECRET, "log": limit}, timeout=30)
+        r.raise_for_status()
+        res = r.json()
+    except Exception as e:
+        raise SheetError(f"не смог прочитать журнал: {e}") from e
+    if not res.get("ok"):
+        raise SheetError(f"таблица отказала: {res.get('error')}")
+    return res.get("log") or []
+
+
 def save(ledger: dict, entries: list | None = None, backup_path: str | None = None) -> None:
     """Пишет реестр в таблицу. Локальная копия — только после успеха таблицы,
     чтобы резерв никогда не оказался новее правды.

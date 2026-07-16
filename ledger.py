@@ -224,6 +224,53 @@ def log_entries(before: dict, after: dict, changes: list, summary: str,
     ]
 
 
+def read_journal(notes_dir: str, user_id: str, limit: int = 15) -> list:
+    """Последние строки журнала из того же источника, где он лежит."""
+    import sheet
+
+    if sheet.enabled():
+        return sheet.journal(limit)
+    p = os.path.join(os.path.dirname(_path(notes_dir, user_id)), "ledger_log.jsonl")
+    if not os.path.exists(p):
+        return []
+    with open(p, encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+    out = []
+    for r in rows[-limit:]:
+        at = str(r.get("at") or "")
+        date, _, time = at.partition(" ")
+        out.append({
+            "date": date, "time": time,
+            "kind": "правка данных" if r.get("kind") == "correction" else "операция",
+            "label": r.get("label") or r.get("path") or "",
+            "before": _num(r.get("before")), "after": _num(r.get("after")),
+            "amount": _num(r.get("amount")), "our_assets": _num(r.get("our_assets")),
+            "summary": r.get("summary") or "",
+        })
+    return out
+
+
+def format_journal(rows: list, fmt_date=lambda s: s) -> str:
+    """Журнал для телефона: что изменилось и когда, свежее сверху."""
+    if not rows:
+        return ("📔 <b>Журнал пуст</b>\n\nЗдесь будет каждое изменение реестра. "
+                "Записи появятся начиная с первой операции.")
+    lines = [f"📔 <b>Журнал — последние {len(rows)}</b>\n"]
+    for r in reversed(rows):  # свежее сверху: смотрят обычно последнее
+        d = f"{fmt_date(r['date'])} {r['time']}".strip()
+        mark = "🛠" if r["kind"].startswith("правка") else "•"
+        amount = _num(r["amount"])
+        sign = "+" if amount > 0 else "−"
+        lines.append(
+            f"{mark} <b>{d}</b> — {r['label']}\n"
+            f"   {fmt(r['before'])} → <b>{fmt(r['after'])}</b> "
+            f"({sign}{fmt(abs(amount))} {CURRENCY})"
+        )
+        if r.get("summary"):
+            lines.append(f"   <i>{r['summary']}</i>")
+    return "\n".join(lines)
+
+
 def format_preview(before: dict, changes: list, summary: str, today: str,
                    correction: bool = False) -> str:
     """Что именно изменится. Показываем до применения — тут ловятся ошибки.
@@ -336,6 +383,59 @@ def check_expense(rec: dict) -> list[str]:
     return problems
 
 
+def paid_usd(rec: dict) -> float:
+    """Сколько долларов ушло с рабочего баланса по этой записи."""
+    return _num((rec.get("paid_from_working") or {}).get("usd"))
+
+
+def check_deduct(rec: dict, deduct: bool) -> list[str]:
+    """Можно ли списать этот расход с рабочего баланса.
+
+    Реестр долларовый, а расходы Илья называет чаще в рублях. Курс НЕ выдумываем:
+    ни модель, ни программа не знают, по какому курсу он менял. Нет долларовой
+    суммы — списывать нечего, надо спросить.
+    """
+    if not deduct:
+        return []
+    if not paid_usd(rec):
+        return ["сколько это в долларах? Реестр долларовый, а курс я не придумываю"]
+    return []
+
+
+def format_expense_preview(before: dict, rec: dict, deduct: bool) -> str:
+    """Что запишем в расходы и тронем ли баланс. Показываем до применения."""
+    lines = ["🧾 <b>Расход</b>\n"]
+    if rec.get("note"):
+        lines.append(f"• {rec['note']}")
+    if rec.get("period"):
+        lines.append(f"• Период: {rec['period']}")
+    for name, v in (rec.get("by_person") or {}).items():
+        parts = []
+        if _num(v.get("rub")):
+            parts.append(f"{fmt(v['rub'])} ₽")
+        if _num(v.get("usd")):
+            parts.append(f"{fmt(v['usd'])} $")
+        lines.append(f"• {name}: {' / '.join(parts)}")
+    totals = []
+    if _num(rec.get("total_rub")):
+        totals.append(f"{fmt(rec['total_rub'])} ₽")
+    if _num(rec.get("total_usd")):
+        totals.append(f"{fmt(rec['total_usd'])} $")
+    if totals:
+        lines.append(f"\n<b>Итого: {' / '.join(totals)}</b>")
+
+    usd = paid_usd(rec)
+    if deduct and usd:
+        w = get(before, "wallet.working")
+        lines.append(f"\n➡️ <b>Списываю с рабочего баланса {fmt(usd)} {CURRENCY}</b>")
+        lines.append(f"Рабочий баланс: {fmt(w)} → <b>{fmt(w - usd)}</b> {CURRENCY}")
+    else:
+        # Молчать об этом нельзя: иначе Илья решит, что баланс уменьшился, а он нет.
+        lines.append("\n📌 <b>Баланс не трогаю</b> — только записываю в расходы. "
+                     "Скажешь новый операционный баланс — я его и возьму.")
+    return "\n".join(lines)
+
+
 def expense_rate(rec: dict) -> float | None:
     """Курс, зашитый в саму запись. К балансу не применяется — только справка."""
     p = rec.get("paid_from_working") or {}
@@ -344,13 +444,20 @@ def expense_rate(rec: dict) -> float | None:
 
 
 def add_expense(ledger: dict, rec: dict, deduct: bool, today: str) -> dict:
-    """Кладёт расход в журнал. deduct=False — если доллары уже списаны раньше."""
+    """Кладёт расход в журнал. deduct=False — если доллары уже списаны раньше.
+
+    По умолчанию баланс НЕ трогаем: Илья называет балансы снимками, и снимок
+    затрёт списание — расход учёлся бы дважды или потерялся. Списываем, только
+    если он прямо сказал. Поэтому в самой записи помечаем, тронут баланс или нет:
+    через месяц по сумме этого уже не понять.
+    """
     new = json.loads(json.dumps(ledger))
+    rec = json.loads(json.dumps(rec))
+    rec["deducted"] = bool(deduct)
     new.setdefault("expenses", []).append(rec)
     new["expenses"].sort(key=lambda r: r.get("date") or "")
     if deduct:
-        usd = _num((rec.get("paid_from_working") or {}).get("usd"))
-        _set(new, "wallet.working", get(new, "wallet.working") - usd)
+        _set(new, "wallet.working", get(new, "wallet.working") - paid_usd(rec))
     new["updated_at"] = today
     return new
 

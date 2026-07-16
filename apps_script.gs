@@ -76,6 +76,9 @@ function _fmt(n) {
 function doGet(e) {
   var denied = _denied(e.parameter.secret);
   if (denied) return denied;
+  if (e.parameter.log) {
+    return _json({ ok: true, log: readJournal(_num(e.parameter.log) || 15) });
+  }
   var raw = _sheet(DATA_SHEET, true).getRange('A1').getValue();
   var ledger = null;
   if (raw) {
@@ -169,6 +172,9 @@ function appendJournal(entries) {
     sh.setFrozenRows(1);
     sh.setColumnWidth(4, 220);
     sh.setColumnWidth(9, 420);
+    // Дату и время держим ТЕКСТОМ: иначе Sheets распознает «2026-07-16» как дату
+    // и вернёт боту Date вместо строки. ISO ещё и сортируется хронологически.
+    sh.getRange(1, 1, sh.getMaxRows(), 2).setNumberFormat('@');
   }
   var rows = entries.map(function (e) {
     var at = String(e.at || '');            // "2026-07-16 14:32" по Москве
@@ -186,12 +192,36 @@ function appendJournal(entries) {
   sh.getRange(start, 5, rows.length, 4).setNumberFormat('#,##0 $');
 }
 
+/** Последние N строк журнала — для кнопки «Журнал» в боте. */
+function readJournal(limit) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(JOURNAL_SHEET);
+  if (!sh || sh.getLastRow() < 2) return [];
+  var n = Math.min(limit, sh.getLastRow() - 1);
+  var vals = sh.getRange(sh.getLastRow() - n + 1, 1, n, JOURNAL_HEADERS.length).getValues();
+  return vals.map(function (r) {
+    return {
+      date: _text(r[0]), time: _text(r[1]), kind: _text(r[2]), label: _text(r[3]),
+      before: _num(r[4]), after: _num(r[5]), amount: _num(r[6]),
+      our_assets: _num(r[7]), summary: _text(r[8]),
+    };
+  });
+}
+
+/** Ячейку могли когда-то отформатировать датой — тогда тут Date, а не строка. */
+function _text(v) {
+  if (v instanceof Date) {
+    return Utilities.formatDate(v, 'Europe/Moscow', 'yyyy-MM-dd');
+  }
+  return String(v == null ? '' : v);
+}
+
 function renderExpenses(ledger) {
   var sh = _sheet(EXPENSES_SHEET, false);
   sh.clear();
   var recs = ledger.expenses || [];
 
-  var rows = [['Дата', 'Период', 'Кто', 'Рубли', 'Доллары', 'Комментарий']];
+  var rows = [['Дата', 'Период', 'Кто', 'Рубли', 'Доллары', 'Баланс', 'Комментарий']];
   recs.forEach(function (rec) {
     var by = rec.by_person || {};
     var names = Object.keys(by);
@@ -203,6 +233,9 @@ function renderExpenses(ledger) {
         name,
         _num((by[name] || {}).rub),
         _num((by[name] || {}).usd),
+        // Списан расход с рабочего баланса или только записан. Без этого столбца
+        // через месяц по сумме уже не понять, учтён он в балансе или нет.
+        i === 0 ? (rec.deducted ? 'списан' : 'только запись') : '',
         i === 0 ? (rec.note || '') : '',
       ]);
     });
@@ -214,17 +247,18 @@ function renderExpenses(ledger) {
     if (_num(paid.usd)) {
       tail.push('с рабочего баланса ' + _fmt(paid.rub) + ' ₽ = ' + _fmt(paid.usd) + ' $');
     }
-    rows.push(['', '', 'ИТОГО', _num(rec.total_rub), _num(rec.total_usd), tail.join('; ')]);
-    rows.push(['', '', '', '', '', '']);
+    rows.push(['', '', 'ИТОГО', _num(rec.total_rub), _num(rec.total_usd), '', tail.join('; ')]);
+    rows.push(['', '', '', '', '', '', '']);
   });
 
-  if (recs.length === 0) rows.push(['', '', 'расходов пока нет', '', '', '']);
-  sh.getRange(1, 1, rows.length, 6).setValues(rows);
-  sh.getRange(1, 1, 1, 6).setFontWeight('bold');
+  if (recs.length === 0) rows.push(['', '', 'расходов пока нет', '', '', '', '']);
+  sh.getRange(1, 1, rows.length, 7).setValues(rows);
+  sh.getRange(1, 1, 1, 7).setFontWeight('bold');
   sh.getRange(2, 4, rows.length - 1, 1).setNumberFormat('#,##0 ₽');
   sh.getRange(2, 5, rows.length - 1, 1).setNumberFormat('#,##0 $');
   sh.setColumnWidth(1, 100);
   sh.setColumnWidth(2, 110);
   sh.setColumnWidth(3, 160);
-  sh.setColumnWidth(6, 420);
+  sh.setColumnWidth(6, 110);
+  sh.setColumnWidth(7, 420);
 }

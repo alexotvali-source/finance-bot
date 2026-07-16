@@ -1,16 +1,19 @@
 """
-Telegram-бот — голосовой ассистент для дневных заметок.
+Telegram-бот — реестр денег Ильи, плюс голосовые заметки.
 
-Как работает:
-  1. Надиктовываешь голосовое (или пишешь текст).
-  2. Whisper (OpenAI) расшифровывает аудио в текст.
-  3. Claude приводит расшифровку в порядок: чистит ошибки распознавания,
-     структурирует по пунктам, выделяет цифры/суммы и даёт короткую выжимку.
-  4. Заметка сохраняется в файл текущего дня.
-  5. Команда /day собирает сводную выжимку за весь день — её кладёшь в Cowork
-     «daily dollar balance».
+Деньги (главное):
+  голос/текст -> Whisper -> Claude ИНТЕРПРЕТИРУЕТ сказанное -> превью -> «да» ->
+  запись в Google-таблицу (она и есть правда) + строка в журнал.
 
-Позже функционал легко расширить (категории, экспорт, автосводка вечером).
+Три вещи, которые тут держат всё:
+  1. Модель НИКОГДА не считает. Она только называет услышанную сумму и корзину;
+     вычитание и итоги — в ledger.py. На арифметике и классификации она уже
+     ошибалась: 94 000 не в ту корзину, дебиторка внутрь «под управлением».
+  2. Балансы Илья даёт СНИМКАМИ, а не событиями («операционный баланс 2 213 258»).
+     Поэтому расход по умолчанию баланс не трогает: снимок его всё равно затрёт.
+  3. Ошибки не глушим. Не разобрали — говорим об этом; реестр остаётся как был.
+
+Заметки — отдельно и проще: расшифровал, структурировал, сложил по дням.
 Все ключи — через переменные окружения (см. .env.example и README).
 """
 
@@ -104,12 +107,39 @@ LEDGER_PROMPT = """Ты превращаешь фразу Ильи о деньг
 Верни СТРОГО JSON:
 {
   "is_money": true|false,
+  "kind": "balance"|"expense",
   "summary": "<что происходит, одной строкой по-человечески>",
   "set": [{"path": "<путь>", "amount": <НОВЫЙ остаток, как назвал Илья>}],
   "add": [{"path": "<путь>", "amount": <изменение: + или ->}],
   "correction": true|false,
+  "expense": {
+    "date": "<ГГГГ-ММ-ДД, когда потрачено; не сказано — null>",
+    "period": "<за какой период, словами Ильи: «до 15.03», «15.03–13.07»; иначе пусто>",
+    "by_person": {"<Имя>": {"rub": <сумма>, "usd": <сумма>}},
+    "total_rub": <итого рублей>, "total_usd": <итого долларов>,
+    "covered_by_profit_rub": <если сказал, что часть покрыта прибылью>,
+    "paid_from_working": {"rub": <сколько ушло с рабочего баланса>,
+                          "usd": <та же сумма в долларах, если Илья её назвал>},
+    "note": "<на что потрачено, коротко>"
+  },
+  "deduct": true|false,
   "question": "<если непонятно, о какой позиции речь — что спросить; иначе пусто>"
 }
+
+KIND — что это вообще:
+- "balance" — названы ОСТАТКИ или изменения позиций. Заполняй set/add, expense = null.
+- "expense" — Илья ПОТРАТИЛ деньги: «потратил 300 000 на офис», «расходы за июль:
+  Илья 2 951 930, Дмитрий 10 527 758». Заполняй expense, set/add оставь пустыми.
+
+DEDUCT — трогать ли рабочий баланс. По умолчанию FALSE: Илья называет балансы
+снимками, и снимок затрёт списание. true — ТОЛЬКО если он прямо сказал списать:
+«спиши с рабочего баланса», «вычти из общих». Сомневаешься — false.
+Если deduct=true, а сумма только в рублях — задай question про доллары:
+реестр долларовый, курс придумывать нельзя.
+
+Суммы в expense передавай КАК УСЛЫШАЛ, по каждому человеку отдельно. Итоги тоже
+назови, но НЕ считай их сам — просто повтори то, что сказал Илья; сходимость
+проверит программа и переспросит, если не сойдётся.
 
 CORRECTION — правка неверно записанной цифры, а НЕ движение денег. true, если Илья
 говорит, что данные ошибочны: «это ошибка в данных», «я неверно продиктовал»,
@@ -519,6 +549,7 @@ def format_list(notes: list) -> str:
 # ---------- Кнопки ----------
 BTN_LEDGER = "📊 Реестр"
 BTN_EXPENSES = "🧾 Расходы"
+BTN_JOURNAL = "📔 Журнал"
 BTN_DAY = "🗓 Сводка дня"
 BTN_WEEK = "📅 За неделю"
 BTN_LIST = "📋 Список"
@@ -528,21 +559,23 @@ BTN_UNDO = "↩️ Удалить последнюю"
 BTN_CLEAR = "🧹 Очистить день"
 BTN_HELP = "❓ Помощь"
 
-# Реестр — наверху отдельной строкой: это главная цифра.
-# Ниже по смыслу: сводки / просмотр / поиск и правка / опасное и справка.
+# Первая строка — деньги: реестр (где что лежит), расходы (что потрачено),
+# журнал (что менялось). Это три разных вопроса, и ради них бот и существует.
+# Вторая и третья — заметки: сводки и просмотр. Четвёртая — правка, пятая — опасное.
+# Удаление держим внизу и отдельно от просмотра, чтобы не попасть по нему мимо.
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [BTN_LEDGER, BTN_EXPENSES],
+        [BTN_LEDGER, BTN_EXPENSES, BTN_JOURNAL],
         [BTN_DAY, BTN_WEEK],
-        [BTN_LIST, BTN_HISTORY],
-        [BTN_FIND, BTN_UNDO],
-        [BTN_CLEAR, BTN_HELP],
+        [BTN_LIST, BTN_HISTORY, BTN_FIND],
+        [BTN_UNDO, BTN_CLEAR],
+        [BTN_HELP],
     ],
     resize_keyboard=True,
 )
 
 ALL_BUTTONS = {
-    BTN_LEDGER, BTN_EXPENSES, BTN_DAY, BTN_WEEK, BTN_LIST,
+    BTN_LEDGER, BTN_EXPENSES, BTN_JOURNAL, BTN_DAY, BTN_WEEK, BTN_LIST,
     BTN_HISTORY, BTN_FIND, BTN_UNDO, BTN_CLEAR, BTN_HELP,
 }
 
@@ -605,7 +638,19 @@ def allowed(update: Update) -> bool:
 # ---------- Хендлеры ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 <b>Голосовой блокнот</b>\n"
+        "💰 <b>Деньги — просто говори цифры</b>\n"
+        "«операционный баланс 2 213 258» — весь кошелёк; рабочий баланс посчитаю сам, "
+        "вычтя деньги в управлении\n"
+        "«баланс Макса 973 406» — деньги в управлении, имя можно новое\n"
+        "«потратил 300 000 на офис» — запишу в расходы, баланс НЕ трону\n"
+        "«...спиши с рабочего баланса» — тогда трону, но спрошу сумму в долларах\n"
+        "«это правка данных, я неверно продиктовал» — не назову это прибылью/расходом\n"
+        "Всегда показываю превью и жду «да».\n\n"
+        "📊 <b>Смотреть</b>\n"
+        "/balance — реестр: где что лежит и сколько всего наше\n"
+        "/expenses — расходы: что потрачено и списано ли с баланса\n"
+        "/journal — журнал: что менялось в реестре, когда и почему\n\n"
+        "👋 <b>Заметки</b>\n"
         "Надиктовывай голосовые — расшифрую, структурирую и дам выжимку.\n"
         "Назови дату — запишу задним числом: «10.06.26 забрал у Макса 250 000».\n\n"
         "🗓 <b>Сводки</b>\n"
@@ -714,6 +759,8 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await balance_cmd(update, context)
     if text == BTN_EXPENSES:
         return await expenses_cmd(update, context)
+    if text == BTN_JOURNAL:
+        return await journal_cmd(update, context)
     if text == BTN_DAY:
         return await day_picker(update, context)
     if text == BTN_WEEK:
@@ -787,6 +834,25 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         ledger.format_balance(book, _fmt_date),
+        parse_mode="HTML",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def journal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Журнал: что менялось в реестре, когда и почему."""
+    if not allowed(update):
+        await update.message.reply_text("Доступ только для владельца бота.")
+        return
+    try:
+        rows = ledger.read_journal(NOTES_DIR, str(update.effective_user.id))
+    except Exception as e:
+        # Журнал — про правду; молча показать пустоту вместо истории нельзя.
+        log.exception("journal read error")
+        await update.message.reply_text(f"⚠️ Не смог прочитать журнал: {e}")
+        return
+    await update.message.reply_text(
+        ledger.format_journal(rows, _fmt_date),
         parse_mode="HTML",
         reply_markup=MAIN_KEYBOARD,
     )
@@ -997,6 +1063,38 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Ответ не про подтверждение: отменяем удаление и обрабатываем как обычно.
         await update.message.reply_text(f"Отменил удаление за {_fmt_date(pending)}.")
 
+    # Ждём подтверждения расхода?
+    pending_expense = context.user_data.pop("pending_expense", None)
+    if pending_expense:
+        if _is_yes(transcript):
+            before = await _read_ledger(update, user_id)
+            if before is None:
+                return
+            rec, deduct = pending_expense["rec"], pending_expense["deduct"]
+            book = ledger.add_expense(before, rec, deduct, _today())
+            entries = []
+            if deduct:
+                # Списание меняет рабочий баланс — значит обязано быть в журнале.
+                # Иначе цифра уедет, а следа не останется.
+                usd = ledger.paid_usd(rec)
+                entries = ledger.log_entries(
+                    before, book, [{"path": "wallet.working", "amount": -usd}],
+                    f"Расход: {rec.get('note') or 'без описания'}", False,
+                    _now().strftime("%Y-%m-%d %H:%M"),
+                )
+            if not await _write_ledger(update, user_id, book, entries):
+                return
+            await update.message.reply_text(
+                "✅ Записал в расходы.\n\n" + ledger.format_balance(book, _fmt_date),
+                parse_mode="HTML",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+        if _is_no(transcript):
+            await update.message.reply_text("Отменил — расход не записан.")
+            return
+        await update.message.reply_text("Отменил расход — ничего не записано.")
+
     # Ждём подтверждения операции над реестром?
     pending_ledger = context.user_data.pop("pending_ledger", None)
     meta = context.user_data.pop("pending_ledger_meta", None) or {}
@@ -1148,6 +1246,29 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if money.get("question"):
                 await update.message.reply_text(f"❓ {money['question']}")
                 return
+
+            if money.get("kind") == "expense" and money.get("expense"):
+                rec = money["expense"]
+                rec.setdefault("date", None)
+                rec["date"] = rec.get("date") or _today()
+                deduct = bool(money.get("deduct"))
+                # Сходимость и курс проверяет Python. Не сошлось — не пишем и спрашиваем:
+                # неверная запись в расходах хуже отсутствующей.
+                problems = ledger.check_expense(rec) + ledger.check_deduct(rec, deduct)
+                if problems:
+                    await update.message.reply_text(
+                        "❓ Не сходится, поэтому не записываю:\n"
+                        + "\n".join(f"• {p}" for p in problems)
+                    )
+                    return
+                context.user_data["pending_expense"] = {"rec": rec, "deduct": deduct}
+                await update.message.reply_text(
+                    ledger.format_expense_preview(book, rec, deduct)
+                    + "\n\nЗаписываем? Ответь «да».",
+                    parse_mode="HTML",
+                )
+                return
+
             changes = ledger.to_changes(book, money)
             if not changes:
                 await update.message.reply_text("В реестре ничего не меняется — суммы те же.")
@@ -1189,7 +1310,8 @@ async def _post_init(app: Application) -> None:
     await app.bot.set_my_commands(
         [
             BotCommand("balance", "📊 Реестр: балансы и итоги"),
-            BotCommand("expenses", "🧾 Журнал расходов"),
+            BotCommand("expenses", "🧾 Расходы: что потрачено"),
+            BotCommand("journal", "📔 Журнал: что менялось в реестре"),
             BotCommand("day", "🗓 Сводка дня (можно /day 14-07-26)"),
             BotCommand("week", "📅 Сводка за 7 дней"),
             BotCommand("list", "📋 Записи за сегодня"),
@@ -1216,6 +1338,7 @@ def main():
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CommandHandler("day", day_cmd))
     app.add_handler(CommandHandler("week", week_cmd))
+    app.add_handler(CommandHandler("journal", journal_cmd))
     app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("find", find_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
