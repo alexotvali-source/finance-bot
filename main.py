@@ -655,6 +655,13 @@ def allowed(update: Update) -> bool:
 
 # ---------- Хендлеры ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Не-владельцу (привет, Дмитрий) справку не показываем: она раскрывает механику
+    # реестра, а пользоваться ботом всё равно может только Илья (fail-closed).
+    if not allowed(update):
+        await update.message.reply_text(
+            "ну что, Димасик, это не за камерами подглядывать, но тоже интересно"
+        )
+        return
     await update.message.reply_text(
         "💰 <b>Деньги — просто говори цифры</b>\n"
         "«операционный баланс 2 213 258» — весь кошелёк; рабочий баланс посчитаю сам, "
