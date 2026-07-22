@@ -610,6 +610,103 @@ def _path(notes_dir: str, user_id: str) -> str:
     return os.path.join(d, "ledger.json")
 
 
+# ---------- Отмена: стек снимков «до действия» ----------
+# Отмена через СНИМКИ, а не обратную арифметику: перед каждым применённым действием
+# кладём полный реестр в стек, отмена = вернуть реестр к снимку N шагов назад.
+# Снимок нельзя посчитать неверно — обратный пересчёт можно.
+UNDO_CAP = 20  # храним 20 последних; ~2 КБ на снимок, файл лежит на волюме рядом
+
+
+def _undo_file(notes_dir: str, user_id: str) -> str:
+    return os.path.join(os.path.dirname(_path(notes_dir, user_id)), "undo_stack.json")
+
+
+def _read_undo(f: str) -> list:
+    if not os.path.exists(f):
+        return []
+    try:
+        with open(f, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        log.exception("не смог прочитать стек отмены")
+        return []
+
+
+def _write_undo(f: str, stack: list) -> None:
+    try:
+        os.makedirs(os.path.dirname(f), exist_ok=True)
+        with open(f, "w", encoding="utf-8") as fh:
+            json.dump(stack, fh, ensure_ascii=False)
+    except Exception:
+        # Стек отмены не критичен: реестр уже в таблице. Не роняем действие.
+        log.exception("не смог записать стек отмены")
+
+
+def push_undo(notes_dir: str, user_id: str, before: dict, summary: str, today: str) -> None:
+    """Кладёт состояние ДО действия в стек. Вызывать ПОСЛЕ успешной записи в таблицу:
+    отменять можно только то, что реально применилось."""
+    f = _undo_file(notes_dir, user_id)
+    stack = _read_undo(f)
+    stack.append({"at": today, "summary": summary or "изменение реестра",
+                  "ledger": json.loads(json.dumps(before))})
+    _write_undo(f, stack[-UNDO_CAP:])
+
+
+def peek_undo(notes_dir: str, user_id: str, count: int):
+    """Что даст отмена count действий, НИЧЕГО не меняя.
+    Возвращает (реестр-для-восстановления, список summary от старого к новому, n)
+    или None, если отменять нечего. n может быть меньше count — в стеке меньше."""
+    stack = _read_undo(_undo_file(notes_dir, user_id))
+    if not stack:
+        return None
+    n = max(1, min(count, len(stack)))
+    return json.loads(json.dumps(stack[-n]["ledger"])), [s["summary"] for s in stack[-n:]], n
+
+
+def commit_undo(notes_dir: str, user_id: str, n: int) -> None:
+    """Снимает n верхних снимков со стека. Вызывать ПОСЛЕ успешного восстановления."""
+    f = _undo_file(notes_dir, user_id)
+    stack = _read_undo(f)
+    n = min(n, len(stack))
+    _write_undo(f, stack[:-n] if n else stack)
+
+
+def diff_changes(before: dict, after: dict) -> list:
+    """Изменения по позициям между двумя реестрами — чтобы записать отмену в журнал."""
+    positions = set(paths(before)) | set(paths(after))
+    changes = []
+    for p in positions:
+        d = get(after, p) - get(before, p)
+        if round(d) != 0:
+            changes.append({"path": p, "amount": d})
+    return changes
+
+
+def format_undo_preview(current: dict, restored: dict, summaries: list, n: int,
+                        requested: int) -> str:
+    """Что вернёт отмена: какие действия снимаем и как изменятся итоги."""
+    step = _plural(n, "шаг", "шага", "шагов")
+    lines = [f"↩️ <b>Отмена последних действий</b>\nВерну реестр на {n} {step} назад:\n"]
+    if requested > n:
+        lines.append(f"⚠️ В истории только {n} — столько и отменю.\n")
+    for s in reversed(summaries):  # свежее сверху
+        lines.append(f"• {s}")
+    tc, tr = compute(current), compute(restored)
+    shown = False
+    for name, key in (("Рабочий баланс", "working"),
+                      ("В управлении", "held_total"),
+                      ("Наши активы", "our_assets")):
+        if round(tc[key]) != round(tr[key]):
+            d = tr[key] - tc[key]
+            sign = "+" if d > 0 else "−"
+            lines.append(f"\n{name}: {fmt(tc[key])} → <b>{fmt(tr[key])}</b> "
+                         f"({sign}{fmt(abs(d))} {CURRENCY})")
+            shown = True
+    if not shown:
+        lines.append("\n<i>На итогах это не скажется.</i>")
+    return "\n".join(lines)
+
+
 def migrate(book: dict) -> dict:
     """Приводит реестр к текущей схеме. Нужна, потому что схема менялась поверх
     уже сохранённого файла: позиция была {"amount": N, "verified": ...}, а корзина

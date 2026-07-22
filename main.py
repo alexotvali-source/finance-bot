@@ -142,6 +142,7 @@ LEDGER_PROMPT = """Ты превращаешь фразу Ильи о деньг
     "note": "<на что потрачено, коротко>"
   },
   "deduct": true|false,
+  "undo_count": <сколько последних действий отменить, если Илья просит отмену; иначе 0>,
   "question": "<если непонятно, о какой позиции речь — что спросить; иначе пусто>"
 }
 
@@ -149,9 +150,13 @@ KIND — что это вообще:
 - "balance" — названы ОСТАТКИ или изменения позиций. Заполняй set/add, expense = null.
 - "expense" — Илья ПОТРАТИЛ деньги: «потратил 300 000 на офис», «расходы за июль:
   Илья 2 951 930, Дмитрий 10 527 758». Заполняй expense, set/add оставь пустыми.
-- "delete_expense" — Илья отменяет расход: «удали эту операцию», «удали последний
-  расход», «отмени расход». Больше ничего не заполняй — программа покажет,
-  какой расход удаляет, и переспросит.
+- "delete_expense" — Илья отменяет РАСХОД именно как расход: «удали последний
+  расход», «удали эту трату». Больше ничего не заполняй.
+- "undo" — Илья просит ОТМЕНИТЬ последнее действие/операцию вообще (не обязательно
+  расход): «отмени последнее действие», «отмени последнюю операцию», «откати
+  последнее», «верни как было», «отмени последние 3 действия». undo_count = сколько
+  действий (по умолчанию 1; «последние три» = 3). Больше ничего не заполняй —
+  программа покажет, что вернётся, и переспросит.
 
 ИМЯ В РАСХОДЕ ТЕРЯТЬ НЕЛЬЗЯ. Если в фразе названо имя — оно ОБЯЗАНО попасть
 в by_person, даже когда человек один:
@@ -324,7 +329,8 @@ def mentions_ledger(text: str) -> bool:
     в «удали последний расход» цифр нет вовсе."""
     t = text.lower()
     return any(w in t for w in ("расход", "баланс", "реестр", "управлени",
-                                "дебитор", "актив", "кошел", "спиши", "списа"))
+                                "дебитор", "актив", "кошел", "спиши", "списа",
+                                "отмен", "откат", "действие", "действия", "операци"))
 
 
 def looks_like_edit(text: str) -> bool:
@@ -1073,6 +1079,38 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Ответ не про подтверждение: отменяем удаление и обрабатываем как обычно.
         await update.message.reply_text(f"Отменил удаление за {_fmt_date(pending)}.")
 
+    # Ждём подтверждения отмены действий?
+    pending_undo = context.user_data.pop("pending_undo", None)
+    if pending_undo:
+        if _is_yes(transcript):
+            before = await _read_ledger(update, user_id)
+            if before is None:
+                return
+            peek = ledger.peek_undo(NOTES_DIR, user_id, pending_undo)
+            if peek is None:
+                await update.message.reply_text("Отменять уже нечего.")
+                return
+            restore, _, n = peek
+            # Отмена меняет реестр — значит должна лечь в журнал, как любое изменение.
+            changes = ledger.diff_changes(before, restore)
+            entries = ledger.log_entries(
+                before, restore, changes,
+                f"↩️ Отмена {n} действ.", False, _now().strftime("%Y-%m-%d %H:%M"),
+            ) if changes else []
+            if not await _write_ledger(update, user_id, restore, entries):
+                return
+            ledger.commit_undo(NOTES_DIR, user_id, n)
+            await update.message.reply_text(
+                "✅ Отменил.\n\n" + ledger.format_balance(restore, _fmt_date),
+                parse_mode="HTML",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+        if _is_no(transcript):
+            await update.message.reply_text("Отменил — реестр как был.")
+            return
+        await update.message.reply_text("Отмену не подтвердил — реестр как был.")
+
     # Ждём подтверждения удаления расхода?
     if context.user_data.pop("pending_delete_expense", None):
         if _is_yes(transcript):
@@ -1094,6 +1132,9 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             if not await _write_ledger(update, user_id, book, entries):
                 return
+            ledger.push_undo(NOTES_DIR, user_id, before,
+                             f"Удаление расхода: {ledger.describe_expense(rec, with_date=False)}",
+                             _today())
             await update.message.reply_text(
                 "✅ Удалил.\n\n" + ledger.format_balance(book, _fmt_date),
                 parse_mode="HTML",
@@ -1126,6 +1167,8 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             if not await _write_ledger(update, user_id, book, entries):
                 return
+            ledger.push_undo(NOTES_DIR, user_id, before,
+                             f"Расход: {rec.get('note') or 'без описания'}", _today())
             await update.message.reply_text(
                 "✅ Записал в расходы.\n\n" + ledger.format_balance(book, _fmt_date),
                 parse_mode="HTML",
@@ -1154,6 +1197,8 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if not await _write_ledger(update, user_id, book, entries):
                 return
+            ledger.push_undo(NOTES_DIR, user_id, before,
+                             meta.get("summary") or "Изменение реестра", _today())
             await update.message.reply_text(
                 "✅ Применил.\n\n" + ledger.format_balance(book, _fmt_date),
                 parse_mode="HTML",
@@ -1299,6 +1344,24 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if money.get("is_money"):
             if money.get("question"):
                 await update.message.reply_text(f"❓ {money['question']}")
+                return
+
+            if money.get("kind") == "undo":
+                count = max(1, min(int(money.get("undo_count") or 1), 50))
+                peek = ledger.peek_undo(NOTES_DIR, user_id, count)
+                if peek is None:
+                    await update.message.reply_text("Отменять нечего — история пуста.")
+                    return
+                restore, summaries, n = peek
+                current = await _read_ledger(update, user_id)
+                if current is None:
+                    return
+                context.user_data["pending_undo"] = n
+                await update.message.reply_text(
+                    ledger.format_undo_preview(current, restore, summaries, n, count)
+                    + "\n\nОтменяем? Ответь «да».",
+                    parse_mode="HTML",
+                )
                 return
 
             if money.get("kind") == "delete_expense":
