@@ -141,7 +141,7 @@ LEDGER_PROMPT = """Ты превращаешь фразу Ильи о деньг
                           "usd": <та же сумма в долларах, если Илья её назвал>},
     "note": "<на что потрачено, коротко>"
   },
-  "deduct": true|false,
+  "deduct": "yes"|"no"|"unclear",
   "undo_count": <сколько последних действий отменить, если Илья просит отмену; иначе 0>,
   "question": "<если непонятно, о какой позиции речь — что спросить; иначе пусто>"
 }
@@ -166,13 +166,17 @@ KIND — что это вообще:
 - «общий расход 15 000» без имён → by_person пустой, только total. Это норма.
 - «с пометкой купил старкнет» → note: "купил Старкнет".
 
-DEDUCT — трогать ли рабочий баланс. По умолчанию FALSE: Илья называет балансы
-снимками, и снимок затрёт списание. true — ТОЛЬКО если он прямо сказал списать:
-«спиши с рабочего баланса», «отними с операционного баланса», «вычти из общих».
-(Списание своих трат всегда идёт из рабочего баланса — это наша часть
-операционного кошелька, отдельного пути нет.) Сомневаешься — false.
-Если deduct=true, а сумма только в рублях — задай question про доллары:
-реестр долларовый, курс придумывать нельзя.
+DEDUCT — списывать ли расход с рабочего баланса. Три значения:
+- "yes" — Илья ПРЯМО сказал списать: «спиши с рабочего баланса», «отними
+  с операционного баланса», «вычти из общих». (Списание своих трат всегда идёт
+  из рабочего баланса — это наша часть кошелька, отдельного пути нет.)
+- "no" — Илья ПРЯМО сказал не списывать: «только запиши», «баланс не трогай»,
+  «просто в расходы».
+- "unclear" — он НЕ сказал ни того, ни другого (например «Дмитрий расход 8 027»).
+  НЕ додумывай и НЕ ставь "no" по привычке: программа сама переспросит Илью,
+  списывать или нет. При любой неясности возвращай "unclear".
+Сумму в долларах при "yes" НЕ требуется дублировать — программа спросит сама,
+если расход рублёвый.
 
 Суммы в expense передавай КАК УСЛЫШАЛ, по каждому человеку отдельно. Итоги тоже
 назови, но НЕ считай их сам — просто повтори то, что сказал Илья; сходимость
@@ -580,6 +584,36 @@ def _is_no(text: str) -> bool:
     return text.strip().lower().rstrip(".!") in {
         "нет", "не", "отмена", "отмени", "не надо", "стоп", "no", "n"
     }
+
+
+def _deduct_answer(text: str):
+    """Ответ на «списать или только записать?»: True — списать, False — только
+    записать, None — непонятно. Отрицание проверяем ПЕРВЫМ: «не списывай» содержит
+    и «списыв», но значит именно НЕ списывать."""
+    t = text.lower()
+    if any(w in t for w in ("только запис", "только запиш", "не спис",
+                            "без баланса", "не трог", "запиш без")):
+        return False
+    if any(w in t for w in ("спиши", "списа", "списыв", "с баланса",
+                            "с рабочего", "отними", "вычти")):
+        return True
+    return None
+
+
+async def _offer_expense(update, context, book, rec, deduct: bool) -> None:
+    """Показывает превью расхода и ждёт «да». Курс/доллары проверяет Python:
+    списать рублёвый расход без долларовой суммы нельзя — тогда переспросим."""
+    problems = ledger.check_deduct(rec, deduct)
+    if problems:
+        await update.message.reply_text(
+            "❓ Не могу списать:\n" + "\n".join(f"• {p}" for p in problems)
+        )
+        return
+    context.user_data["pending_expense"] = {"rec": rec, "deduct": deduct}
+    await update.message.reply_text(
+        ledger.format_expense_preview(book, rec, deduct) + "\n\nЗаписываем? Ответь «да».",
+        parse_mode="HTML",
+    )
 
 
 def _first_line(note: dict) -> str:
@@ -1146,6 +1180,20 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update.message.reply_text("Отменил удаление — расход остался на месте.")
 
+    # Ждём ответа «списать или только записать»?
+    if context.user_data.get("pending_expense_ask") is not None:
+        ans = _deduct_answer(transcript)
+        if ans is not None:
+            rec = context.user_data.pop("pending_expense_ask")
+            book = await _read_ledger(update, user_id)
+            if book is None:
+                return
+            await _offer_expense(update, context, book, rec, ans)
+            return
+        # Ответ не про списание — бросаем вопрос и обрабатываем сообщение как обычно
+        # (Илья мог передумать и продиктовать что-то другое).
+        context.user_data.pop("pending_expense_ask", None)
+
     # Ждём подтверждения расхода?
     pending_expense = context.user_data.pop("pending_expense", None)
     if pending_expense:
@@ -1390,22 +1438,25 @@ async def handle_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 rec = money["expense"]
                 rec.setdefault("date", None)
                 rec["date"] = rec.get("date") or _today()
-                deduct = bool(money.get("deduct"))
-                # Сходимость и курс проверяет Python. Не сошлось — не пишем и спрашиваем:
-                # неверная запись в расходах хуже отсутствующей.
-                problems = ledger.check_expense(rec) + ledger.check_deduct(rec, deduct)
+                # Сходимость проверяем сразу: она не зависит от списания.
+                problems = ledger.check_expense(rec)
                 if problems:
                     await update.message.reply_text(
                         "❓ Не сходится, поэтому не записываю:\n"
                         + "\n".join(f"• {p}" for p in problems)
                     )
                     return
-                context.user_data["pending_expense"] = {"rec": rec, "deduct": deduct}
-                await update.message.reply_text(
-                    ledger.format_expense_preview(book, rec, deduct)
-                    + "\n\nЗаписываем? Ответь «да».",
-                    parse_mode="HTML",
-                )
+                deduct = str(money.get("deduct") or "unclear").lower()
+                if deduct not in ("yes", "no"):
+                    # Илья не сказал, списывать или нет — не решаем за него, спрашиваем.
+                    context.user_data["pending_expense_ask"] = rec
+                    who = ledger.describe_expense(rec, with_date=False)
+                    await update.message.reply_text(
+                        f"🧾 {who}\n\nСписать с рабочего баланса или только записать "
+                        "в расходы?\nОтветь «спиши» или «только запись»."
+                    )
+                    return
+                await _offer_expense(update, context, book, rec, deduct == "yes")
                 return
 
             changes = ledger.to_changes(book, money)
