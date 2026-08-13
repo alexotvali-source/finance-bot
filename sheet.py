@@ -16,9 +16,13 @@ Railway, у неё есть версии и бэкапы от Google.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 
 import requests
+
+log = logging.getLogger(__name__)
 
 WEBHOOK_URL = os.environ.get("SHEET_WEBHOOK_URL", "")
 SECRET = os.environ.get("SHEET_SECRET", "")
@@ -59,23 +63,51 @@ def journal(limit: int = 15) -> list:
     return res.get("log") or []
 
 
+def _content(ledger: dict | None) -> str:
+    """Смысловая часть реестра без updated_at — чтобы сравнивать «применилось или нет»."""
+    if not ledger:
+        return ""
+    core = {k: ledger.get(k) for k in ("wallet", "assets", "receivables", "expenses")}
+    return json.dumps(core, sort_keys=True, ensure_ascii=False)
+
+
+def _post_once(ledger: dict, entries: list | None) -> None:
+    body = {"secret": SECRET, "ledger": ledger}
+    if entries:
+        body["log"] = entries
+    r = requests.post(WEBHOOK_URL, json=body, timeout=30)
+    r.raise_for_status()
+    res = r.json()
+    if not res.get("ok"):
+        raise SheetError(f"таблица отказала: {res.get('error')}")
+
+
 def save(ledger: dict, entries: list | None = None, backup_path: str | None = None) -> None:
     """Пишет реестр в таблицу. Локальная копия — только после успеха таблицы,
     чтобы резерв никогда не оказался новее правды.
 
     entries — строки журнала этой операции. Таблица их ДОПИСЫВАЕТ на отдельный лист;
-    сюда шлём только новые, всю историю гонять незачем."""
-    body = {"secret": SECRET, "ledger": ledger}
-    if entries:
-        body["log"] = entries
+    сюда шлём только новые, всю историю гонять незачем.
+
+    Устойчивость к транзиентному сбою: Apps Script иногда отдаёт 404 на промежуточном
+    редиректе googleusercontent, хотя запись УЖЕ прошла. Поэтому при ошибке сначала
+    перечитываем таблицу: если реестр там уже равен нашему — считаем успехом и НЕ
+    повторяем (иначе задвоили бы строки журнала). Не равен — один раз повторяем."""
     try:
-        r = requests.post(WEBHOOK_URL, json=body, timeout=30)
-        r.raise_for_status()
-        res = r.json()
+        _post_once(ledger, entries)
     except Exception as e:
-        raise SheetError(f"не смог записать в таблицу: {e}") from e
-    if not res.get("ok"):
-        raise SheetError(f"таблица не сохранила: {res.get('error')}")
+        log.warning("запись в таблицу не удалась (%s), проверяю, не применилось ли уже", e)
+        applied = False
+        try:
+            applied = _content(load()) == _content(ledger)
+        except Exception:
+            applied = False
+        if not applied:
+            time.sleep(2)
+            try:
+                _post_once(ledger, entries)
+            except Exception as e2:
+                raise SheetError(f"таблица недоступна (повтор не помог): {e2}") from e2
 
     if backup_path:
         try:
