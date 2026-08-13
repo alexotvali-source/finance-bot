@@ -37,30 +37,36 @@ def enabled() -> bool:
     return bool(WEBHOOK_URL and SECRET)
 
 
+def _get(params: dict, what: str) -> dict:
+    """GET к таблице с повторами. Чтение идемпотентно — повторять безопасно.
+    Apps Script на холодном старте иногда не укладывается в таймаут; один такой
+    таймаут не должен превращаться в «не смог показать цифры»."""
+    last = None
+    for attempt in range(3):
+        try:
+            r = requests.get(WEBHOOK_URL, params=params, timeout=25)
+            r.raise_for_status()
+            res = r.json()
+        except Exception as e:
+            last = e
+            log.warning("%s — попытка %d не удалась: %s", what, attempt + 1, e)
+            time.sleep(1.5)
+            continue
+        # Логический отказ (forbidden и т.п.) повтором не лечится — сразу наверх.
+        if not res.get("ok"):
+            raise SheetError(f"таблица отказала: {res.get('error')}")
+        return res
+    raise SheetError(f"{what} за 3 попытки: {last}")
+
+
 def load() -> dict | None:
     """Читает реестр из таблицы. None — таблица пуста (первый запуск)."""
-    try:
-        r = requests.get(WEBHOOK_URL, params={"secret": SECRET}, timeout=30)
-        r.raise_for_status()
-        res = r.json()
-    except Exception as e:
-        raise SheetError(f"не смог прочитать таблицу: {e}") from e
-    if not res.get("ok"):
-        raise SheetError(f"таблица отказала: {res.get('error')}")
-    return res.get("ledger")
+    return _get({"secret": SECRET}, "таблица не ответила").get("ledger")
 
 
 def journal(limit: int = 15) -> list:
     """Последние строки журнала. Живут в таблице, а не в реестре."""
-    try:
-        r = requests.get(WEBHOOK_URL, params={"secret": SECRET, "log": limit}, timeout=30)
-        r.raise_for_status()
-        res = r.json()
-    except Exception as e:
-        raise SheetError(f"не смог прочитать журнал: {e}") from e
-    if not res.get("ok"):
-        raise SheetError(f"таблица отказала: {res.get('error')}")
-    return res.get("log") or []
+    return _get({"secret": SECRET, "log": limit}, "журнал не ответил").get("log") or []
 
 
 def _content(ledger: dict | None) -> str:
