@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 
 import requests
@@ -30,6 +31,15 @@ SECRET = os.environ.get("SHEET_SECRET", "")
 
 class SheetError(RuntimeError):
     """Таблица недоступна или отказала. Наверх уходит честной ошибкой."""
+
+
+def _safe(e) -> str:
+    """Текст ошибки без секрета. requests кладёт в исключение полный URL, включая
+    ?secret=..., и он утекал пользователю в чат. Вырезаем секрет и весь query."""
+    msg = str(e)
+    if SECRET:
+        msg = msg.replace(SECRET, "***")
+    return re.sub(r"([?&]secret=)[^&\s]+", r"\1***", msg)
 
 
 def enabled() -> bool:
@@ -56,7 +66,7 @@ def _get(params: dict, what: str) -> dict:
         if not res.get("ok"):
             raise SheetError(f"таблица отказала: {res.get('error')}")
         return res
-    raise SheetError(f"{what} за 3 попытки: {last}")
+    raise SheetError(f"{what} за 3 попытки: {_safe(last)}")
 
 
 def load() -> dict | None:
@@ -113,7 +123,7 @@ def save(ledger: dict, entries: list | None = None, backup_path: str | None = No
             try:
                 _post_once(ledger, entries)
             except Exception as e2:
-                raise SheetError(f"таблица недоступна (повтор не помог): {e2}") from e2
+                raise SheetError(f"таблица недоступна (повтор не помог): {_safe(e2)}") from e2
 
     if backup_path:
         try:
