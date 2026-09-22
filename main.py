@@ -890,6 +890,23 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def dump_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Присылает локальную резервную копию реестра (файл с диска Railway).
+    Нужна для восстановления, если Google-таблица пропала."""
+    if not allowed(update):
+        await update.message.reply_text("Доступ только для владельца бота.")
+        return
+    path = ledger.backup_file(NOTES_DIR, str(update.effective_user.id))
+    if not os.path.exists(path):
+        await update.message.reply_text("Локальной резервной копии на диске нет.")
+        return
+    with open(path, "rb") as f:
+        await update.message.reply_document(
+            document=f, filename="ledger_backup.json",
+            caption="Резервная копия реестра с диска (реестр + расходы).",
+        )
+
+
 async def journal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Журнал: что менялось в реестре, когда и почему."""
     if not can_view(update):
@@ -1531,6 +1548,7 @@ def main():
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("expenses", expenses_cmd))
     app.add_handler(CommandHandler("journal", journal_cmd))
+    app.add_handler(CommandHandler("dump", dump_cmd))
     # Нажатия кнопок клавиатуры — до общего обработчика заметок.
     app.add_handler(MessageHandler(filters.Text(ALL_BUTTONS), buttons))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_note))

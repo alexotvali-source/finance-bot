@@ -598,6 +598,11 @@ def format_expenses(ledger: dict, fmt_date=lambda s: s) -> str:
 
 
 # ---------- Хранение ----------
+def backup_file(notes_dir: str, user_id: str) -> str:
+    """Путь к локальной резервной копии реестра на волюме (её пишет sheet.save)."""
+    return _path(notes_dir, user_id)
+
+
 def _path(notes_dir: str, user_id: str) -> str:
     d = os.path.join(notes_dir, str(user_id))
     os.makedirs(d, exist_ok=True)
