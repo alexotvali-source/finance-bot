@@ -341,10 +341,7 @@ def format_balance(ledger: dict, fmt_date=lambda s: s) -> str:
 
     held = wallet.get("held") or {}
     if held:
-        lines.append(
-            f"\n🤝 <b>В управлении — {fmt(t['held_total'])} {CURRENCY}</b> "
-            f"<i>(чужие деньги, лежат у нас)</i>"
-        )
+        lines.append(f"\n🤝 <b>В управлении — {fmt(t['held_total'])} {CURRENCY}</b>")
         for name, amount in held.items():
             lines.append(f"• {name}: {fmt(amount)} {CURRENCY}")
 
@@ -360,10 +357,7 @@ def format_balance(ledger: dict, fmt_date=lambda s: s) -> str:
         for name, amount in recv.items():
             lines.append(f"• {name}: {fmt(amount)} {CURRENCY}")
 
-    lines.append(
-        f"\n<b>Наши активы (Илья + Дмитрий): {fmt(t['our_assets'])} {CURRENCY}</b>"
-        f"\n<i>рабочий баланс + активы + дебиторка; чужие деньги не входят</i>"
-    )
+    lines.append(f"\n<b>Наши активы (Илья + Дмитрий): {fmt(t['our_assets'])} {CURRENCY}</b>")
     if ledger.get("updated_at"):
         lines.append(f"<i>обновлено: {fmt_date(ledger['updated_at'])}</i>")
     return "\n".join(lines)
