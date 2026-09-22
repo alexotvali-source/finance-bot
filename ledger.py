@@ -357,7 +357,7 @@ def format_balance(ledger: dict, fmt_date=lambda s: s) -> str:
         for name, amount in recv.items():
             lines.append(f"• {name}: {fmt(amount)} {CURRENCY}")
 
-    lines.append(f"\n<b>Наши активы (Илья + Дмитрий): {fmt(t['our_assets'])} {CURRENCY}</b>")
+    lines.append(f"\n<b>Наши активы: {fmt(t['our_assets'])} {CURRENCY}</b>")
     if ledger.get("updated_at"):
         lines.append(f"<i>обновлено: {fmt_date(ledger['updated_at'])}</i>")
     return "\n".join(lines)
